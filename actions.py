@@ -44,8 +44,10 @@ except ImportError:  # pragma: no cover
 
 try:
     import socketio
+    from socketio import packet as socketio_packet
 except ImportError:  # pragma: no cover
     socketio = None
+    socketio_packet = None  # type: ignore[assignment]
 
 
 class LovenseError(Exception):
@@ -61,6 +63,178 @@ EVENT_APP_STATUS = "basicapi_update_app_status_tc"
 EVENT_APP_ONLINE = "basicapi_update_app_online_tc"
 
 EventCallback = Callable[[dict], None]
+
+
+def _decode_one_socketio_packet(encoded: str) -> tuple[Any, int, int]:
+    """
+    Decode a single Socket.IO packet from ``encoded``.
+
+    Lovense's developer.io hub sometimes concatenates multiple Socket.IO
+    packets inside one Engine.IO message (e.g. ``0{}2["event",…]``). Stock
+    ``python-socketio`` uses ``json.loads`` on the remainder and raises
+    ``JSONDecodeError: Extra data`` (often at column 3 / char 2 when the first
+    payload is ``{}``).
+
+    Returns ``(packet, attachment_count, chars_consumed)``.
+    """
+    if socketio_packet is None:  # pragma: no cover
+        raise RuntimeError("python-socketio is not installed")
+
+    ep = encoded
+    original_len = len(ep)
+    try:
+        packet_type = int(ep[0:1])
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError(f"invalid socket.io packet type in {encoded[:40]!r}") from exc
+    ep = ep[1:]
+
+    attachment_count = 0
+    dash = ep.find("-")
+    if dash > 0 and ep[0:dash].isdigit():
+        if dash > 10:
+            raise ValueError("too many attachments")
+        attachment_count = int(ep[0:dash])
+        ep = ep[dash + 1 :]
+
+    namespace = None
+    if ep and ep[0:1] == "/":
+        sep = ep.find(",")
+        if sep == -1:
+            namespace = ep
+            ep = ""
+        else:
+            namespace = ep[0:sep]
+            ep = ep[sep + 1 :]
+        q = namespace.find("?")
+        if q != -1:
+            namespace = namespace[0:q]
+
+    pkt_id = None
+    if ep and ep[0].isdigit():
+        i = 1
+        end = len(ep)
+        while i < end:
+            if not ep[i].isdigit() or i >= 100:
+                break
+            i += 1
+        pkt_id = int(ep[:i])
+        ep = ep[i:]
+        if ep and ep[0].isdigit():
+            raise ValueError("id field is too long")
+
+    data = None
+    if ep:
+        # raw_decode consumes only the first JSON value; leftover is the next packet.
+        data, idx = json.JSONDecoder().raw_decode(ep)
+        ep = ep[idx:]
+
+    pkt = socketio_packet.Packet(
+        packet_type=packet_type,
+        data=data,
+        namespace=namespace,
+        id=pkt_id,
+        binary=False,
+    )
+    # Preserve wire type for BINARY_* attachment handling.
+    pkt.packet_type = packet_type
+    pkt.attachment_count = attachment_count
+    pkt.attachments = []
+    consumed = original_len - len(ep)
+    return pkt, attachment_count, consumed
+
+
+def _make_resilient_socketio_client(**kwargs: Any) -> Any:
+    """
+    python-socketio Client that tolerates Lovense multi-packet Engine.IO frames.
+
+    Also soft-fails binary attachment glitches (``packet queue is empty``) instead
+    of killing the background engineio read thread.
+    """
+    if socketio is None:  # pragma: no cover
+        raise LovenseError("python-socketio is not installed")
+
+    class _ResilientClient(socketio.Client):  # type: ignore[misc]
+        def _handle_eio_message(self, data: Any) -> None:  # noqa: ANN401
+            # Binary attachment path (follow-up frames after BINARY_EVENT/ACK).
+            if self._binary_packet is not None:
+                try:
+                    super()._handle_eio_message(data)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"  [warn] socket binary attachment ignored: {exc}",
+                        file=sys.stderr,
+                    )
+                    self._binary_packet = None
+                return
+
+            # Non-text frames: defer to stock client.
+            if not isinstance(data, str):
+                try:
+                    super()._handle_eio_message(data)
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"  [warn] socket packet ignored: {exc}",
+                        file=sys.stderr,
+                    )
+                    self._binary_packet = None
+                return
+
+            remaining = data
+            # Hard cap: avoid infinite loops on corrupt streams.
+            for _ in range(32):
+                if not remaining:
+                    return
+                try:
+                    pkt, attachment_count, consumed = _decode_one_socketio_packet(
+                        remaining
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"  [warn] socket packet decode failed: {exc} "
+                        f"prefix={remaining[:64]!r}",
+                        file=sys.stderr,
+                    )
+                    return
+
+                if consumed <= 0:
+                    print(
+                        f"  [warn] socket packet made no progress; dropping "
+                        f"prefix={remaining[:64]!r}",
+                        file=sys.stderr,
+                    )
+                    return
+                remaining = remaining[consumed:]
+
+                if pkt.packet_type == socketio_packet.CONNECT:
+                    self._handle_connect(pkt.namespace, pkt.data)
+                elif pkt.packet_type == socketio_packet.DISCONNECT:
+                    self._handle_disconnect(pkt.namespace)
+                elif pkt.packet_type == socketio_packet.EVENT:
+                    self._handle_event(pkt.namespace, pkt.id, pkt.data)
+                elif pkt.packet_type == socketio_packet.ACK:
+                    self._handle_ack(pkt.namespace, pkt.id, pkt.data)
+                elif pkt.packet_type in (
+                    socketio_packet.BINARY_EVENT,
+                    socketio_packet.BINARY_ACK,
+                ):
+                    pkt.attachment_count = attachment_count
+                    self._binary_packet = pkt
+                    if remaining:
+                        print(
+                            "  [warn] trailing data after binary packet header; "
+                            f"prefix={remaining[:64]!r}",
+                            file=sys.stderr,
+                        )
+                    return
+                elif pkt.packet_type == socketio_packet.CONNECT_ERROR:
+                    self._handle_error(pkt.namespace, pkt.data)
+                else:
+                    print(
+                        f"  [warn] unknown socket packet type {pkt.packet_type}",
+                        file=sys.stderr,
+                    )
+
+    return _ResilientClient(**kwargs)
 
 
 def _parse_socket_payload(data: Any) -> Any:
@@ -310,7 +484,9 @@ class LovenseSocketClient:
         print(f"  socket = {socket_url} path={socket_path}")
 
         # Lovense documents Socket.IO client 2.x; websocket-only is required.
-        sio = socketio.Client(
+        # Use a resilient client: their hub sometimes concatenates packets in one
+        # Engine.IO frame (python-socketio's stock decoder raises JSONDecodeError).
+        sio = _make_resilient_socketio_client(
             reconnection=True,
             reconnection_attempts=5,
             reconnection_delay=1,
