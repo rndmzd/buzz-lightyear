@@ -1,0 +1,44 @@
+# Buzz Lightyear — Caddy reverse proxy for the Docker pairing stack.
+#
+# PAIRING_DOMAIN is substituted from the compose environment:
+#   - Production:  PAIRING_DOMAIN=pair.example.com  (automatic HTTPS via Let's Encrypt)
+#   - Local test:  PAIRING_DOMAIN=localhost          (local HTTPS / HTTP as Caddy decides)
+#
+# Upstream service name `pairing` matches deploy/caddy/compose.yml.
+
+{
+	# Optional: email for ACME registration (recommended in production)
+	# email admin@example.com
+}
+
+{$PAIRING_DOMAIN:localhost} {
+	encode gzip
+
+	# Security headers (pairing UI is public; token stays on the app)
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+
+	reverse_proxy pairing:8080 {
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+
+		# Owner UI polls /api/pairing/status while waiting on Connect
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 60s
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
