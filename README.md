@@ -49,9 +49,18 @@ scrape the server `.env`. They call a small authenticated API to learn
 | `CONTROLLER_API_KEY` | Shared secret for remote controllers |
 
 ```sh
-pip install -r requirements.txt
+uv sync
 cp .env.example .env   # fill server section
-python -m webapp       # e.g. http://0.0.0.0:8080/
+uv run python -m webapp       # e.g. http://0.0.0.0:8080/
+```
+
+Or run the pairing helper with **Caddy + Docker** (automatic HTTPS):
+
+```sh
+cp .env.example .env
+# set LOVENSE_TOKEN, CONTROLLER_API_KEY, LOVENSE_PLATFORM
+# set PAIRING_DOMAIN=pair.example.com  (DNS A/AAAA → this host)
+docker compose -f deploy/caddy/compose.yml up -d --build
 ```
 
 Owner: open the site → **Pair with Lovense** → scan with **Lovense Connect**.
@@ -92,15 +101,16 @@ Then the controller does its own Socket.IO flow:
 
 ```sh
 # controller .env: LOVENSE_TOKEN, PAIRING_SERVER_URL, CONTROLLER_API_KEY
-python controller_gui.py          # GUI: connect + fetch identity
-python voice_trigger.py --model ./vosk-model-small-en-us-0.15
-python voice_trigger.py --model ./vosk-model-small-en-us-0.15 --test
+uv sync   # includes voice deps (vosk / sounddevice) via the controller group
+uv run python controller_gui.py          # GUI: connect + fetch identity
+uv run python voice_trigger.py --model ./vosk-model-small-en-us-0.15
+uv run python voice_trigger.py --model ./vosk-model-small-en-us-0.15 --test
 ```
 
 ### Controller GUI
 
 ```sh
-python controller_gui.py
+uv run python controller_gui.py
 ```
 
 Tabs:
@@ -110,10 +120,16 @@ Tabs:
 | **Connection** | Pairing server URL, API key, developer token; Test / Fetch identity / Save |
 | **Triggers** | Edit phrase groups → Lovense `action` / `timeSec` / `cooldown`; load/save `triggers.json` |
 | **Voice** | Vosk model + mic; Start/Stop listening; test mode; activity log |
+| **Sensor** | UDP motion stream from ESP32; maps 0–1 values → `Vibrate:0–20` while controlling |
 
 Voice listening uses the same `TriggerEngine` + Socket.IO path as the CLI.
 Save triggers from the GUI to update `triggers.json` (also used by
 `voice_trigger.py`).
+
+**Sensor tab:** selecting the tab (or **Start stream + Lovense**) binds the UDP
+port (default `5005`) and connects the Socket API when identity + token are
+ready. **Begin control** maps the live stream to continuous vibration
+(rate-limited); **End control** sends Stop.
 
 You do **not** manually copy `LOVENSE_UID` if `PAIRING_SERVER_URL` is set—unless
 you want to override with a local `LOVENSE_UID` and leave the server URL unset.
@@ -129,11 +145,15 @@ you want to override with a local `LOVENSE_UID` and leave the server URL unset.
 | `actions.py` | Lovense Socket.IO client (commands) |
 | `voice_trigger.py` | Voice controller CLI |
 | `recognition.py` / `triggers.py` | STT + phrase map |
+| `deploy/caddy/` | Docker Compose + Caddy reverse proxy for pairing |
+| `deploy/docker/Dockerfile` | Pairing server container image |
+| `deploy/nginx/pairing-server.conf` | Host nginx TLS reverse proxy sample |
 | `src/main.cpp` | ESP32 motion firmware (MPU6050 → UDP stream) |
 | `include/wifi_config.example.h` | SoftAP / board defaults template (copy to `wifi_config.h`) |
 | `src/setup_mode.cpp` | Double-RST SoftAP setup portal + status LED |
 | `src/credentials_store.cpp` | NVS storage for station Wi-Fi + UDP target |
-| `tools/udp_receiver.py` | Host UDP receiver, stats, optional CSV log |
+| `sensor_stream.py` | UDP packet codec + threaded receiver (GUI + CLI) |
+| `tools/udp_receiver.py` | CLI host UDP receiver, stats, optional CSV log |
 
 ## API (pairing server)
 
@@ -157,6 +177,48 @@ examples. On match, emit Function fields via Socket.IO (not HTTP POST).
 * Developer token stays on servers/controllers you control—never in the QR page JS.  
 * The controller identity API intentionally **does not** return `LOVENSE_TOKEN`.  
 
+### Reverse proxy options
+
+Set controllers’ `PAIRING_SERVER_URL` to the public HTTPS origin (no trailing
+slash), e.g. `https://pair.example.com`.
+
+#### Caddy + Docker (recommended alternative)
+
+Stack: **Caddy** (TLS, HTTP→HTTPS) + **pairing** Flask image.
+
+| Path | Role |
+|------|------|
+| [deploy/caddy/compose.yml](deploy/caddy/compose.yml) | `pairing` + `caddy` services |
+| [deploy/caddy/Caddyfile](deploy/caddy/Caddyfile) | reverse proxy + security headers |
+| [deploy/docker/Dockerfile](deploy/docker/Dockerfile) | slim pairing image (no vosk/mic deps) |
+
+```sh
+# .env (repo root): LOVENSE_TOKEN, CONTROLLER_API_KEY, LOVENSE_PLATFORM
+# PAIRING_DOMAIN=pair.example.com
+
+docker compose -f deploy/caddy/compose.yml up -d --build
+docker compose -f deploy/caddy/compose.yml logs -f
+```
+
+Caddy obtains certificates automatically when `PAIRING_DOMAIN` is a real public
+hostname pointing at the host. Pair result is stored in the `pairing_data`
+volume (`PAIRING_STATE_PATH=/data/pairing_state.json`).
+
+#### nginx (host install)
+
+Sample config: **[deploy/nginx/pairing-server.conf](deploy/nginx/pairing-server.conf)**.
+
+On the pairing host, bind the app to loopback and leave nginx on 443:
+
+```sh
+# .env on the pairing server
+WEB_HOST=127.0.0.1
+WEB_PORT=8080
+
+uv run python -m webapp
+# nginx proxies https://pair.example.com → http://127.0.0.1:8080
+```
+
 ## ESP32 motion (UDP over Wi-Fi)
 
 Optional wrist-wave firmware streams a **0.0–1.0** normalized motion value from
@@ -177,7 +239,7 @@ pio device monitor   # 115200
 #    enter home Wi-Fi SSID/password + host LAN IP + UDP port → Save
 
 # 3. On the host (same LAN as the ESP32 station), receive samples
-python tools/udp_receiver.py --port 5005
-python tools/udp_receiver.py --port 5005 --csv samples.csv
-python tools/udp_receiver.py --self-test
+uv run python tools/udp_receiver.py --port 5005
+uv run python tools/udp_receiver.py --port 5005 --csv samples.csv
+uv run python tools/udp_receiver.py --self-test
 ```

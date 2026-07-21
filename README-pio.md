@@ -179,17 +179,17 @@ debugging.
 
 ## Host receiver
 
-Standard library only (no extra pip packages):
+Standard library only (no extra Python packages):
 
 ```sh
 # Live stream (bind all interfaces, port 5005)
-python tools/udp_receiver.py --port 5005
+uv run python tools/udp_receiver.py --port 5005
 
 # Quiet mode + CSV log (batched flush)
-python tools/udp_receiver.py --port 5005 --quiet --csv samples.csv
+uv run python tools/udp_receiver.py --port 5005 --quiet --csv samples.csv
 
 # Codec / gap-detection self-test (no hardware)
-python tools/udp_receiver.py --self-test
+uv run python tools/udp_receiver.py --self-test
 ```
 
 The receiver:
