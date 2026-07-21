@@ -35,7 +35,7 @@ def fetch_pairing_health(
     """GET /api/health on the pairing helper (no API key required)."""
     if requests is None:
         raise ControllerConfigError(
-            "'requests' is required. Install with: pip install requests"
+            "'requests' is required. Install project deps with: uv sync"
         )
     base = (pairing_server_url or env("PAIRING_SERVER_URL") or "").rstrip("/")
     if not base:
@@ -78,7 +78,7 @@ def fetch_owner_identity(
     """
     if requests is None:
         raise ControllerConfigError(
-            "'requests' is required. Install with: pip install requests"
+            "'requests' is required. Install project deps with: uv sync"
         )
 
     base = (pairing_server_url or env("PAIRING_SERVER_URL") or "").rstrip("/")

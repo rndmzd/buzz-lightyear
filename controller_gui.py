@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Controller GUI — pairing-server identity, trigger config, and voice listening.
+Controller GUI — pairing-server identity, triggers, voice, and sensor stream.
 
 Desktop UI for the controller machine (separate from the pairing web app).
 """
@@ -10,11 +10,11 @@ from __future__ import annotations
 import json
 import os
 import queue
-import threading
+import time
 import tkinter as tk
 import traceback
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
 from dotenv import load_dotenv
@@ -36,6 +36,11 @@ from controller_client import (
     fetch_pairing_health,
 )
 from recognition import RecognitionError, VoiceListener, list_input_device_choices
+from sensor_stream import (
+    DEFAULT_UDP_PORT,
+    UdpSensorReceiver,
+    map_value_to_level,
+)
 from triggers import (
     ActionDefaults,
     TriggerAction,
@@ -147,12 +152,21 @@ class ControllerApp(tk.Tk):
         self._engine: TriggerEngine | None = None
         self._ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
 
+        # Sensor (UDP motion) stream state
+        self._sensor_receiver: UdpSensorReceiver | None = None
+        self._sensor_control_active = False
+        self._sensor_last_level: int | None = None
+        self._sensor_last_send_mono = 0.0
+        self._sensor_commands_sent = 0
+        self._notebook: ttk.Notebook | None = None
+
         self._build_style()
         self._build_ui()
         self._load_from_env()
         self._load_triggers_file(silent=True)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self._drain_ui_queue)
+        self.after(50, self._sensor_tick)
 
     # --- style / layout -----------------------------------------------------
 
@@ -200,7 +214,7 @@ class ControllerApp(tk.Tk):
         ttk.Label(
             outer,
             text="Connect to the pairing server, configure phrase → Lovense "
-            "outputs, then start voice listening.",
+            "outputs, use voice listening, or map the ESP32 UDP sensor stream.",
             wraplength=780,
         ).pack(anchor=tk.W, pady=(4, 10))
 
@@ -211,17 +225,22 @@ class ControllerApp(tk.Tk):
 
         nb = ttk.Notebook(outer)
         nb.pack(fill=tk.BOTH, expand=True)
+        self._notebook = nb
 
         tab_conn = ttk.Frame(nb, padding=10)
         tab_trig = ttk.Frame(nb, padding=10)
         tab_voice = ttk.Frame(nb, padding=10)
+        tab_sensor = ttk.Frame(nb, padding=10)
         nb.add(tab_conn, text="Connection")
         nb.add(tab_trig, text="Triggers")
         nb.add(tab_voice, text="Voice")
+        nb.add(tab_sensor, text="Sensor")
 
         self._build_connection_tab(tab_conn)
         self._build_triggers_tab(tab_trig)
         self._build_voice_tab(tab_voice)
+        self._build_sensor_tab(tab_sensor)
+        nb.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     def _build_connection_tab(self, parent: ttk.Frame) -> None:
         conn = ttk.LabelFrame(parent, text="Pairing server connection", padding=12)
@@ -431,6 +450,139 @@ class ControllerApp(tk.Tk):
 
         self._refresh_devices()
 
+    def _build_sensor_tab(self, parent: ttk.Frame) -> None:
+        intro = ttk.Label(
+            parent,
+            text="Selecting this tab starts the UDP receiver and connects to the "
+            "Lovense Socket API (when identity + token are ready). Press "
+            "Begin control to map the live 0–1 motion stream to vibration.",
+            wraplength=760,
+        )
+        intro.pack(anchor=tk.W, pady=(0, 8))
+
+        cfg = ttk.LabelFrame(parent, text="UDP stream", padding=12)
+        cfg.pack(fill=tk.X, pady=(0, 8))
+
+        self.var_udp_port = tk.StringVar(
+            value=env("UDP_SENSOR_PORT", str(DEFAULT_UDP_PORT)) or str(DEFAULT_UDP_PORT)
+        )
+        self.var_sensor_max_level = tk.StringVar(
+            value=env("SENSOR_MAX_LEVEL", "20") or "20"
+        )
+        self.var_sensor_cmd_hz = tk.StringVar(
+            value=env("SENSOR_CMD_HZ", "10") or "10"
+        )
+        self.var_sensor_deadband = tk.StringVar(
+            value=env("SENSOR_DEADBAND", "0.02") or "0.02"
+        )
+        self.var_sensor_time_sec = tk.StringVar(
+            value=env("SENSOR_TIME_SEC", "1.0") or "1.0"
+        )
+        self.var_sensor_test = tk.BooleanVar(value=False)
+
+        self._row_entry(
+            cfg, 0, "UDP listen port", self.var_udp_port,
+            hint="Must match ESP32 setup form / UDP_PORT (default 5005)",
+        )
+        self._row_entry(
+            cfg, 1, "Max vibration level (0–20)", self.var_sensor_max_level,
+            hint="Maps sensor 1.0 → this Lovense Vibrate level",
+        )
+        self._row_entry(
+            cfg, 2, "Command rate (Hz)", self.var_sensor_cmd_hz,
+            hint="How often to push intensity while controlling (not 200 Hz)",
+        )
+        self._row_entry(
+            cfg, 3, "Input deadband", self.var_sensor_deadband,
+            hint="Values at or below this map to Stop / level 0",
+        )
+        self._row_entry(
+            cfg, 4, "Command timeSec", self.var_sensor_time_sec,
+            hint="Duration sent with each Function (stopPrevious=1)",
+        )
+        ttk.Checkbutton(
+            cfg,
+            text="Test mode (map + log only, no Lovense emit)",
+            variable=self.var_sensor_test,
+        ).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(8, 0))
+
+        status = ttk.LabelFrame(parent, text="Live status", padding=12)
+        status.pack(fill=tk.X, pady=(0, 8))
+
+        self.var_sensor_stream = tk.StringVar(value="UDP: stopped")
+        self.var_sensor_lovense = tk.StringVar(value="Lovense: not connected")
+        self.var_sensor_control = tk.StringVar(value="Control: idle")
+        self.var_sensor_value = tk.StringVar(value="Value: —")
+        self.var_sensor_level = tk.StringVar(value="Level: —")
+        self.var_sensor_stats = tk.StringVar(
+            value="recv=0  rate=—  gaps=0  cmds=0"
+        )
+
+        ttk.Label(status, textvariable=self.var_sensor_stream).pack(anchor=tk.W)
+        ttk.Label(status, textvariable=self.var_sensor_lovense).pack(anchor=tk.W)
+        ttk.Label(status, textvariable=self.var_sensor_control).pack(anchor=tk.W)
+        ttk.Label(status, textvariable=self.var_sensor_value).pack(anchor=tk.W)
+        ttk.Label(status, textvariable=self.var_sensor_level).pack(anchor=tk.W)
+        ttk.Label(status, textvariable=self.var_sensor_stats).pack(
+            anchor=tk.W, pady=(4, 0)
+        )
+
+        # Simple value bar (Canvas)
+        bar_frame = ttk.Frame(status)
+        bar_frame.pack(fill=tk.X, pady=(8, 0))
+        self._sensor_bar = tk.Canvas(
+            bar_frame, height=18, bg="#0c0e13", highlightthickness=0
+        )
+        self._sensor_bar.pack(fill=tk.X)
+        self._sensor_bar_rect = self._sensor_bar.create_rectangle(
+            0, 0, 0, 18, fill="#ffc14d", width=0
+        )
+
+        controls = ttk.Frame(parent)
+        controls.pack(fill=tk.X, pady=(0, 8))
+        self.btn_sensor_start = ttk.Button(
+            controls, text="Start stream + Lovense", command=self.on_sensor_start
+        )
+        self.btn_sensor_start.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_sensor_begin = ttk.Button(
+            controls,
+            text="Begin control",
+            command=self.on_sensor_begin_control,
+            state=tk.DISABLED,
+        )
+        self.btn_sensor_begin.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_sensor_end = ttk.Button(
+            controls,
+            text="End control",
+            command=self.on_sensor_end_control,
+            state=tk.DISABLED,
+        )
+        self.btn_sensor_end.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_sensor_stop = ttk.Button(
+            controls,
+            text="Stop stream",
+            command=self.on_sensor_stop,
+            state=tk.DISABLED,
+        )
+        self.btn_sensor_stop.pack(side=tk.LEFT)
+
+        log_box = ttk.LabelFrame(parent, text="Sensor activity", padding=8)
+        log_box.pack(fill=tk.BOTH, expand=True)
+        self.txt_sensor_log = tk.Text(
+            log_box,
+            height=10,
+            wrap=tk.WORD,
+            bg="#0c0e13",
+            fg="#c5d0e0",
+            insertbackground="#e8ecf4",
+            relief=tk.FLAT,
+            font=("Consolas", 9),
+        )
+        slog = ttk.Scrollbar(log_box, command=self.txt_sensor_log.yview)
+        self.txt_sensor_log.configure(yscrollcommand=slog.set)
+        self.txt_sensor_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        slog.pack(side=tk.RIGHT, fill=tk.Y)
+
     def _row_entry(
         self,
         parent: ttk.LabelFrame | ttk.Frame,
@@ -542,6 +694,10 @@ class ControllerApp(tk.Tk):
         self.txt_log.insert(tk.END, message.rstrip() + "\n")
         self.txt_log.see(tk.END)
 
+    def _sensor_log(self, message: str) -> None:
+        self.txt_sensor_log.insert(tk.END, message.rstrip() + "\n")
+        self.txt_sensor_log.see(tk.END)
+
     def _queue_ui(self, kind: str, payload: Any = None) -> None:
         self._ui_queue.put((kind, payload))
 
@@ -551,11 +707,16 @@ class ControllerApp(tk.Tk):
                 kind, payload = self._ui_queue.get_nowait()
                 if kind == "log":
                     self._log(str(payload))
+                elif kind == "sensor_log":
+                    self._sensor_log(str(payload))
                 elif kind == "status":
                     self.var_listen_state.set(str(payload))
                 elif kind == "error":
                     self._log(f"ERROR: {payload}")
                     self.var_listen_state.set("Error")
+                elif kind == "sensor_error":
+                    self._sensor_log(f"ERROR: {payload}")
+                    self.var_sensor_stream.set("UDP: error")
                 elif kind == "listening_stopped":
                     self._set_listening_ui(False)
         except queue.Empty:
@@ -854,8 +1015,9 @@ class ControllerApp(tk.Tk):
             actions, on_match, log_matches=False
         )
 
-    def _ensure_lovense_client(self) -> LovenseSocketClient | None:
-        if self.var_test_mode.get():
+    def _ensure_lovense_client(self, *, force: bool = False) -> LovenseSocketClient | None:
+        # Voice tab test mode skips connect unless force=True (sensor path).
+        if not force and self.var_test_mode.get():
             return None
         if not self._control_ready():
             raise LovenseError(
@@ -977,7 +1139,352 @@ class ControllerApp(tk.Tk):
         self._set_listening_ui(False)
         self._log("Stop requested.")
 
+    # --- sensor (UDP motion → Lovense) --------------------------------------
+
+    def _on_notebook_tab_changed(self, _event: object | None = None) -> None:
+        nb = self._notebook
+        if nb is None:
+            return
+        try:
+            title = nb.tab(nb.select(), "text")
+        except tk.TclError:
+            return
+        if title == "Sensor":
+            # Selecting the Sensor tab starts UDP + Lovense (idempotent).
+            self.after(50, lambda: self.on_sensor_start(from_tab=True))
+
+    def _sensor_parse_port(self) -> int:
+        try:
+            port = int(self.var_udp_port.get().strip() or DEFAULT_UDP_PORT)
+        except ValueError as exc:
+            raise ValueError("UDP port must be an integer.") from exc
+        if not (1 <= port <= 65535):
+            raise ValueError("UDP port must be between 1 and 65535.")
+        return port
+
+    def _sensor_mapping_params(self) -> dict[str, float | int]:
+        try:
+            max_level = int(float(self.var_sensor_max_level.get().strip() or "20"))
+            cmd_hz = float(self.var_sensor_cmd_hz.get().strip() or "10")
+            deadband = float(self.var_sensor_deadband.get().strip() or "0")
+            time_sec = float(self.var_sensor_time_sec.get().strip() or "1")
+        except ValueError as exc:
+            raise ValueError(
+                "Max level, command rate, deadband, and timeSec must be numbers."
+            ) from exc
+        max_level = max(0, min(20, max_level))
+        if cmd_hz <= 0:
+            cmd_hz = 10.0
+        if cmd_hz > 30:
+            cmd_hz = 30.0  # keep socket traffic reasonable
+        deadband = max(0.0, min(0.99, deadband))
+        if time_sec < 0:
+            time_sec = 0.0
+        return {
+            "max_level": max_level,
+            "cmd_hz": cmd_hz,
+            "deadband": deadband,
+            "time_sec": time_sec,
+        }
+
+    def _set_sensor_stream_ui(self, running: bool) -> None:
+        self.btn_sensor_start.configure(
+            state=tk.DISABLED if running else tk.NORMAL
+        )
+        self.btn_sensor_stop.configure(
+            state=tk.NORMAL if running else tk.DISABLED
+        )
+        self.btn_sensor_begin.configure(
+            state=tk.NORMAL if running and not self._sensor_control_active else tk.DISABLED
+        )
+        self.btn_sensor_end.configure(
+            state=tk.NORMAL if self._sensor_control_active else tk.DISABLED
+        )
+
+    def on_sensor_start(self, *, from_tab: bool = False) -> None:
+        """Start UDP receiver and connect Lovense Socket API."""
+        if self._sensor_receiver is not None and self._sensor_receiver.running:
+            if not from_tab:
+                self._sensor_log("UDP stream already running.")
+            # Still ensure Lovense if identity became ready later
+            self._sensor_try_connect_lovense(quiet=from_tab)
+            return
+
+        try:
+            port = self._sensor_parse_port()
+        except ValueError as exc:
+            if not from_tab:
+                messagebox.showwarning("UDP port", str(exc))
+            else:
+                self._sensor_log(f"Cannot start stream: {exc}")
+            return
+
+        def on_error(msg: str) -> None:
+            self._queue_ui("sensor_error", msg)
+
+        try:
+            receiver = UdpSensorReceiver(
+                host="0.0.0.0",
+                port=port,
+                on_error=on_error,
+            )
+            receiver.start()
+        except OSError as exc:
+            msg = f"Could not bind UDP {port}: {exc}"
+            if not from_tab:
+                messagebox.showerror("UDP", msg)
+            else:
+                self._sensor_log(msg)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if not from_tab:
+                messagebox.showerror(
+                    "UDP", f"{exc}\n\n{traceback.format_exc()}"
+                )
+            else:
+                self._sensor_log(f"UDP start failed: {exc}")
+            return
+
+        self._sensor_receiver = receiver
+        self.var_sensor_stream.set(f"UDP: listening on 0.0.0.0:{port}")
+        self._set_sensor_stream_ui(True)
+        self._sensor_log(f"UDP receiver started on port {port}.")
+        upsert_env_value(ENV_PATH, "UDP_SENSOR_PORT", str(port))
+
+        self._sensor_try_connect_lovense(quiet=from_tab)
+
+    def _sensor_try_connect_lovense(self, *, quiet: bool = False) -> bool:
+        if self.var_sensor_test.get():
+            self.var_sensor_lovense.set("Lovense: test mode (no emit)")
+            if not quiet:
+                self._sensor_log("Test mode: Lovense socket not required.")
+            return True
+        if not self._control_ready():
+            self.var_sensor_lovense.set(
+                "Lovense: not ready — fetch identity + set token on Connection tab"
+            )
+            if not quiet:
+                self._sensor_log(
+                    "Lovense not connected yet (need paired identity + token)."
+                )
+            return False
+        try:
+            self._ensure_lovense_client(force=True)
+            self.var_sensor_lovense.set("Lovense: Socket API connected")
+            self._sensor_log("Lovense Socket API connected.")
+            return True
+        except LovenseError as exc:
+            self.var_sensor_lovense.set(f"Lovense: error — {exc}")
+            if not quiet:
+                messagebox.showerror("Lovense", str(exc))
+            else:
+                self._sensor_log(f"Lovense connect failed: {exc}")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            self.var_sensor_lovense.set(f"Lovense: error — {exc}")
+            if not quiet:
+                messagebox.showerror(
+                    "Lovense", f"{exc}\n\n{traceback.format_exc()}"
+                )
+            else:
+                self._sensor_log(f"Lovense connect failed: {exc}")
+            return False
+
+    def on_sensor_stop(self) -> None:
+        if self._sensor_control_active:
+            self.on_sensor_end_control()
+        if self._sensor_receiver is not None:
+            try:
+                self._sensor_receiver.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._sensor_receiver = None
+        self.var_sensor_stream.set("UDP: stopped")
+        self.var_sensor_control.set("Control: idle")
+        self.var_sensor_value.set("Value: —")
+        self.var_sensor_level.set("Level: —")
+        self._set_sensor_stream_ui(False)
+        self._sensor_log("UDP stream stopped.")
+
+    def on_sensor_begin_control(self) -> None:
+        if self._sensor_receiver is None or not self._sensor_receiver.running:
+            messagebox.showwarning(
+                "Sensor",
+                "Start the UDP stream first (open this tab or press "
+                "Start stream + Lovense).",
+            )
+            return
+        try:
+            self._sensor_mapping_params()
+        except ValueError as exc:
+            messagebox.showwarning("Mapping", str(exc))
+            return
+
+        if not self.var_sensor_test.get():
+            if not self._sensor_try_connect_lovense(quiet=False):
+                return
+        else:
+            self.var_sensor_lovense.set("Lovense: test mode (no emit)")
+
+        self._sensor_control_active = True
+        self._sensor_last_level = None
+        self._sensor_last_send_mono = 0.0
+        self._sensor_commands_sent = 0
+        self.var_sensor_control.set("Control: ACTIVE — mapping stream → toy")
+        self._set_sensor_stream_ui(True)
+        self._sensor_log(
+            "Begin control: sensor values mapped to Vibrate:0–20 "
+            f"(cmd rate ≤ {self.var_sensor_cmd_hz.get()} Hz)."
+        )
+
+    def on_sensor_end_control(self) -> None:
+        was_active = self._sensor_control_active
+        self._sensor_control_active = False
+        self.var_sensor_control.set("Control: idle")
+        self._set_sensor_stream_ui(self._sensor_receiver is not None)
+        if was_active:
+            # Stop toy when leaving continuous control
+            if not self.var_sensor_test.get() and self._client is not None:
+                try:
+                    self._client.send_intensity(0, time_sec=0.0, stop_previous=1)
+                    self._sensor_log("Sent Stop to Lovense.")
+                except Exception as exc:  # noqa: BLE001
+                    self._sensor_log(f"Stop command failed: {exc}")
+            else:
+                self._sensor_log("End control (test mode — no Stop emit).")
+            self._sensor_log(
+                f"Control ended. Commands sent this session: {self._sensor_commands_sent}"
+            )
+
+    def _sensor_update_bar(self, value: float | None) -> None:
+        canvas = self._sensor_bar
+        canvas.update_idletasks()
+        width = max(canvas.winfo_width(), 1)
+        height = 18
+        if value is None:
+            canvas.coords(self._sensor_bar_rect, 0, 0, 0, height)
+            return
+        v = max(0.0, min(1.0, float(value)))
+        canvas.coords(self._sensor_bar_rect, 0, 0, int(width * v), height)
+
+    def _sensor_tick(self) -> None:
+        """UI + control loop: poll latest UDP sample and optionally emit intensity."""
+        try:
+            receiver = self._sensor_receiver
+            if receiver is not None and receiver.running:
+                value = receiver.latest_value
+                stats = receiver.stats
+                if value is not None:
+                    self.var_sensor_value.set(f"Value: {value:.4f}")
+                    self._sensor_update_bar(value)
+                else:
+                    self.var_sensor_value.set("Value: (waiting for packets…)")
+                    self._sensor_update_bar(None)
+
+                rate = stats.rate_hz(time.monotonic())
+                self.var_sensor_stats.set(
+                    f"recv={stats.received}  rate≈{rate:.1f} Hz  "
+                    f"gaps={stats.gaps}  reject={stats.rejected}  "
+                    f"cmds={self._sensor_commands_sent}"
+                )
+
+                level: int | None = None
+                if value is not None:
+                    try:
+                        params = self._sensor_mapping_params()
+                    except ValueError:
+                        params = {
+                            "max_level": 20,
+                            "cmd_hz": 10.0,
+                            "deadband": 0.02,
+                            "time_sec": 1.0,
+                        }
+                    level = map_value_to_level(
+                        value,
+                        max_level=int(params["max_level"]),
+                        deadband=float(params["deadband"]),
+                    )
+                    self.var_sensor_level.set(
+                        f"Level: {level} / {int(params['max_level'])} "
+                        f"({'Stop' if level == 0 else f'Vibrate:{level}'})"
+                    )
+
+                    if self._sensor_control_active:
+                        self._sensor_maybe_send(
+                            level,
+                            time_sec=float(params["time_sec"]),
+                            cmd_hz=float(params["cmd_hz"]),
+                        )
+            elif self._sensor_receiver is None:
+                # keep idle labels stable
+                pass
+        except Exception:  # noqa: BLE001
+            # Never let the tick crash the GUI event loop
+            pass
+        self.after(50, self._sensor_tick)
+
+    def _sensor_maybe_send(
+        self, level: int, *, time_sec: float, cmd_hz: float
+    ) -> None:
+        now = time.monotonic()
+        min_interval = 1.0 / max(cmd_hz, 0.1)
+        level_changed = self._sensor_last_level is None or level != self._sensor_last_level
+        due = (now - self._sensor_last_send_mono) >= min_interval
+        # Always send on level change if enough time passed; also refresh
+        # while non-zero so the toy doesn't time out mid-stroke.
+        if not due:
+            return
+        if not level_changed and level == 0 and self._sensor_last_level == 0:
+            return
+        if not level_changed and level > 0 and (now - self._sensor_last_send_mono) < max(
+            min_interval, time_sec * 0.5
+        ):
+            # Allow periodic refresh at cmd_hz even if level holds
+            pass
+
+        test_mode = self.var_sensor_test.get()
+        try:
+            if test_mode:
+                # Log sparingly: only on level changes
+                if level_changed:
+                    self._sensor_log(
+                        f"[test] map → {'Stop' if level == 0 else f'Vibrate:{level}'}"
+                    )
+            else:
+                client = self._client
+                if client is None:
+                    if not self._sensor_try_connect_lovense(quiet=True):
+                        return
+                    client = self._client
+                if client is None:
+                    return
+                client.send_intensity(
+                    level,
+                    time_sec=time_sec if level > 0 else 0.0,
+                    stop_previous=1,
+                    test_mode=False,
+                )
+                if level_changed:
+                    self._sensor_log(
+                        f"→ {'Stop' if level == 0 else f'Vibrate:{level}'}"
+                    )
+            self._sensor_last_level = level
+            self._sensor_last_send_mono = now
+            self._sensor_commands_sent += 1
+        except Exception as exc:  # noqa: BLE001
+            self._sensor_log(f"Send failed: {exc}")
+
     def on_close(self) -> None:
+        try:
+            if self._sensor_control_active:
+                self.on_sensor_end_control()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._sensor_receiver is not None:
+                self._sensor_receiver.stop()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             if self._listener:
                 self._listener.stop()
