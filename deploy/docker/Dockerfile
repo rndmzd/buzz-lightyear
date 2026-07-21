@@ -42,7 +42,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
     WEB_HOST=0.0.0.0 \
     WEB_PORT=8080 \
     WEB_DEBUG=0 \
-    PAIRING_STATE_PATH=/data/pairing_state.json
+    PAIRING_STATE_PATH=/data/pairing_state.json \
+    GUNICORN_WORKERS=1 \
+    GUNICORN_THREADS=8 \
+    GUNICORN_TIMEOUT=60
 
 # Persistent pair result (uid / paired status) across container restarts
 RUN mkdir -p /data && chown -R appuser:appuser /data /app
@@ -54,4 +57,13 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"
 
-CMD ["python", "-m", "webapp"]
+# Single worker: pairing sessions are process-local (pairing.manager).
+CMD ["gunicorn", \
+     "--bind", "0.0.0.0:8080", \
+     "--workers", "1", \
+     "--threads", "8", \
+     "--timeout", "60", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--capture-output", \
+     "webapp.wsgi:app"]

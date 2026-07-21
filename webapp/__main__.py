@@ -1,4 +1,11 @@
-"""python -m webapp"""
+"""python -m webapp — local / debug entry (Flask development server).
+
+For production, use gunicorn instead::
+
+    gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 webapp.wsgi:app
+
+See deploy/systemd/buzz-pairing.service and deploy/docker/Dockerfile.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +32,7 @@ def main() -> None:
     debug = (env("WEB_DEBUG", "0") or "0") in ("1", "true", "True", "yes")
     print(f"Lovense pairing web app → http://{host}:{port}/")
     print("Device owners open this URL, click Pair, and scan with Lovense Connect.")
+    print("Tip: production installs should use gunicorn (webapp.wsgi:app), not this server.")
     app.run(host=host, port=port, debug=debug, threaded=True)
 
 

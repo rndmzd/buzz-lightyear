@@ -8,7 +8,7 @@ Voice (and future) triggers that drive a **Lovense** toy over the
 ```
 ┌──────────────────────────┐     HTTPS      ┌─────────────────────────────┐
 │ Owner's computer         │───────────────►│ Remote pairing server       │
-│ (browser: view QR)       │                │ python -m webapp            │
+│ (browser: view QR)       │                │ gunicorn + Caddy/nginx      │
 └──────────────────────────┘                │ · LOVENSE_TOKEN (secret)    │
                                             │ · CONTROLLER_API_KEY        │
 ┌──────────────────────────┐   scan QR      │ · only job: owner pairing   │
@@ -48,20 +48,15 @@ scrape the server `.env`. They call a small authenticated API to learn
 | `LOVENSE_PLATFORM` | Dashboard website name |
 | `CONTROLLER_API_KEY` | Shared secret for remote controllers |
 
+For a quick local check (not public HTTPS):
+
 ```sh
 uv sync
-cp .env.example .env   # fill server section
+cp .env.example .env   # fill server section above
 uv run python -m webapp       # e.g. http://0.0.0.0:8080/
 ```
 
-Or run the pairing helper with **Caddy + Docker** (automatic HTTPS):
-
-```sh
-cp .env.example .env
-# set LOVENSE_TOKEN, CONTROLLER_API_KEY, LOVENSE_PLATFORM
-# set PAIRING_DOMAIN=pair.example.com  (DNS A/AAAA → this host)
-docker compose -f deploy/caddy/compose.yml up -d --build
-```
+For always-on public hosting, see **[Deploying the pairing server](#deploying-the-pairing-server)** below.
 
 Owner: open the site → **Pair with Lovense** → scan with **Lovense Connect**.
 
@@ -146,8 +141,10 @@ you want to override with a local `LOVENSE_UID` and leave the server URL unset.
 | `voice_trigger.py` | Voice controller CLI |
 | `recognition.py` / `triggers.py` | STT + phrase map |
 | `deploy/caddy/` | Docker Compose + Caddy reverse proxy for pairing |
-| `deploy/docker/Dockerfile` | Pairing server container image |
+| `deploy/docker/Dockerfile` | Pairing server container image (gunicorn) |
+| `deploy/systemd/buzz-pairing.service` | Host systemd unit (gunicorn + restart) |
 | `deploy/nginx/pairing-server.conf` | Host nginx TLS reverse proxy sample |
+| `webapp/wsgi.py` | Production WSGI entry (`webapp.wsgi:app`) |
 | `src/main.cpp` | ESP32 motion firmware (MPU6050 → UDP stream) |
 | `include/wifi_config.example.h` | SoftAP / board defaults template (copy to `wifi_config.h`) |
 | `src/setup_mode.cpp` | Double-RST SoftAP setup portal + status LED |
@@ -170,54 +167,273 @@ you want to override with a local `LOVENSE_UID` and leave the server URL unset.
 Edit `triggers.json` on the **controller** (phrase → Function). See file for
 examples. On match, emit Function fields via Socket.IO (not HTTP POST).
 
-## Security notes
+## Deploying the pairing server
 
-* Put the pairing site behind **HTTPS** on the public internet.  
-* `CONTROLLER_API_KEY` should be long and random; treat it like a password.  
-* Developer token stays on servers/controllers you control—never in the QR page JS.  
-* The controller identity API intentionally **does not** return `LOVENSE_TOKEN`.  
+The pairing helper is the only process that should be reachable on the public
+internet. Controllers stay on private machines and call
+`GET /api/controller/identity` over HTTPS with `CONTROLLER_API_KEY`.
 
-### Reverse proxy options
+| Option | When to use | Files |
+|--------|-------------|--------|
+| **A. Caddy + Docker** | VPS/home server; want auto HTTPS and restarts | [deploy/caddy/](deploy/caddy/), [deploy/docker/Dockerfile](deploy/docker/Dockerfile) |
+| **B. nginx + systemd** | Linux host where you already run nginx | [deploy/nginx/pairing-server.conf](deploy/nginx/pairing-server.conf), [deploy/systemd/buzz-pairing.service](deploy/systemd/buzz-pairing.service) |
+| **Local debug only** | Laptop / one-shot pairing | `uv run python -m webapp` |
 
-Set controllers’ `PAIRING_SERVER_URL` to the public HTTPS origin (no trailing
-slash), e.g. `https://pair.example.com`.
+**Requirements that apply to every production install**
 
-#### Caddy + Docker (recommended alternative)
+* Public hostname (e.g. `pair.example.com`) with DNS **A/AAAA** pointing at the host.
+* **HTTPS** in front of the app (Caddy or nginx). Do not expose Flask/gunicorn on `:8080` to the world.
+* `.env` with at least:
 
-Stack: **Caddy** (TLS, HTTP→HTTPS) + **pairing** Flask image.
+  | Variable | Notes |
+  |----------|--------|
+  | `LOVENSE_TOKEN` | Developer token (server-side only) |
+  | `LOVENSE_PLATFORM` | Name from the Lovense developer dashboard |
+  | `CONTROLLER_API_KEY` | Long random secret; same value on every controller |
 
-| Path | Role |
-|------|------|
-| [deploy/caddy/compose.yml](deploy/caddy/compose.yml) | `pairing` + `caddy` services |
-| [deploy/caddy/Caddyfile](deploy/caddy/Caddyfile) | reverse proxy + security headers |
-| [deploy/docker/Dockerfile](deploy/docker/Dockerfile) | slim pairing image (no vosk/mic deps) |
+* Production app entry is **gunicorn** with **exactly one worker** (pairing sessions are in-memory):
+
+  ```sh
+  gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 webapp.wsgi:app
+  ```
+
+  Docker and the systemd unit already use this. Do not raise `--workers` above `1`.
+
+* After deploy, set each controller’s  
+  `PAIRING_SERVER_URL=https://pair.example.com`  
+  (no trailing slash) and the same `CONTROLLER_API_KEY` / `LOVENSE_TOKEN`.
+
+---
+
+### Option A — Caddy + Docker (recommended)
+
+Stack: **Caddy** (TLS + reverse proxy) and **pairing** (gunicorn image). Both use
+`restart: unless-stopped`. Pair state lives in a Docker volume.
+
+**1. Prepare the host**
+
+* Install [Docker](https://docs.docker.com/get-docker/) and Docker Compose v2.
+* Open inbound **TCP 80** and **443** (and UDP 443 if you want HTTP/3).
+* Point DNS for your domain at this machine.
+
+**2. Configure secrets**
 
 ```sh
-# .env (repo root): LOVENSE_TOKEN, CONTROLLER_API_KEY, LOVENSE_PLATFORM
-# PAIRING_DOMAIN=pair.example.com
+cd /path/to/buzz-lightyear
+cp .env.example .env
+```
 
+Edit `.env` (pairing section):
+
+```env
+LOVENSE_TOKEN=…
+LOVENSE_PLATFORM=Rys Circus
+CONTROLLER_API_KEY=…          # long random string
+PAIRING_DOMAIN=pair.example.com
+```
+
+`PAIRING_DOMAIN` is read by Compose for Caddy’s site address. Compose also
+passes the Lovense variables into the `pairing` container.
+
+**3. Start the stack**
+
+```sh
 docker compose -f deploy/caddy/compose.yml up -d --build
+docker compose -f deploy/caddy/compose.yml ps
 docker compose -f deploy/caddy/compose.yml logs -f
 ```
 
-Caddy obtains certificates automatically when `PAIRING_DOMAIN` is a real public
-hostname pointing at the host. Pair result is stored in the `pairing_data`
-volume (`PAIRING_STATE_PATH=/data/pairing_state.json`).
-
-#### nginx (host install)
-
-Sample config: **[deploy/nginx/pairing-server.conf](deploy/nginx/pairing-server.conf)**.
-
-On the pairing host, bind the app to loopback and leave nginx on 443:
+Caddy obtains a Let’s Encrypt certificate automatically when `PAIRING_DOMAIN`
+is a real public name. For a local smoke test only:
 
 ```sh
-# .env on the pairing server
-WEB_HOST=127.0.0.1
-WEB_PORT=8080
-
-uv run python -m webapp
-# nginx proxies https://pair.example.com → http://127.0.0.1:8080
+PAIRING_DOMAIN=localhost docker compose -f deploy/caddy/compose.yml up --build
 ```
+
+**4. Verify**
+
+```sh
+curl -sS https://pair.example.com/api/health
+# → {"ok":true,"role":"pairing_helper",…}
+
+# Owner UI
+# open https://pair.example.com/ → Pair with Lovense → scan with Connect
+```
+
+**5. Day-2 operations**
+
+```sh
+# Update code + rebuild
+git pull
+docker compose -f deploy/caddy/compose.yml up -d --build
+
+# Logs
+docker compose -f deploy/caddy/compose.yml logs -f pairing
+docker compose -f deploy/caddy/compose.yml logs -f caddy
+
+# Stop
+docker compose -f deploy/caddy/compose.yml down
+# Keep volumes (pair state + certs): omit -v
+# Wipe pair state + certs:  docker compose -f deploy/caddy/compose.yml down -v
+```
+
+| Volume | Contents |
+|--------|----------|
+| `pairing_data` | `PAIRING_STATE_PATH=/data/pairing_state.json` (uid / paired status) |
+| `caddy_data` | ACME certificates |
+| `caddy_config` | Caddy internal config |
+
+---
+
+### Option B — nginx + systemd (host install)
+
+Runs gunicorn under **systemd** on loopback; **nginx** terminates TLS on 80/443.
+Default install path in the unit file is `/opt/buzz-lightyear` — edit the unit
+if your checkout lives elsewhere.
+
+**1. Install the app**
+
+```sh
+# Example layout; use your own user/path if preferred
+sudo mkdir -p /opt/buzz-lightyear
+sudo chown "$USER":"$USER" /opt/buzz-lightyear
+cd /opt/buzz-lightyear
+# clone or copy the repo into this directory, then:
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if uv is not installed
+uv sync --no-default-groups    # pairing deps only (skip vosk/mic); or: uv sync
+
+cp .env.example .env
+# Set LOVENSE_TOKEN, LOVENSE_PLATFORM, CONTROLLER_API_KEY
+# Leave WEB_HOST unset in .env — the unit forces 127.0.0.1
+```
+
+Create a system user (matches the unit’s `User=buzz`):
+
+```sh
+sudo useradd --system --home /opt/buzz-lightyear --shell /usr/sbin/nologin buzz
+sudo chown -R buzz:buzz /opt/buzz-lightyear
+```
+
+**2. Enable the systemd service**
+
+```sh
+sudo cp deploy/systemd/buzz-pairing.service /etc/systemd/system/
+# If the repo is not at /opt/buzz-lightyear, edit WorkingDirectory, EnvironmentFile,
+# ExecStart, and ReadWritePaths in the unit before enabling.
+sudo systemctl daemon-reload
+sudo systemctl enable --now buzz-pairing
+sudo systemctl status buzz-pairing
+journalctl -u buzz-pairing -f
+```
+
+Confirm the app answers on loopback only:
+
+```sh
+curl -sS http://127.0.0.1:8080/api/health
+```
+
+**3. Install nginx + TLS**
+
+```sh
+sudo apt install nginx certbot python3-certbot-nginx   # Debian/Ubuntu example
+sudo cp deploy/nginx/pairing-server.conf /etc/nginx/sites-available/pairing-server
+sudo ln -sf /etc/nginx/sites-available/pairing-server /etc/nginx/sites-enabled/
+```
+
+Edit the site file:
+
+* Set every `server_name` to your domain (e.g. `pair.example.com`).
+* Adjust `ssl_certificate` / `ssl_certificate_key` paths, **or** obtain certs first
+  with certbot (see below).
+
+Issue certificates (DNS must already point here; port 80 reachable):
+
+```sh
+# Option 1: certbot manages the nginx site
+sudo certbot --nginx -d pair.example.com
+
+# Option 2: certbot certonly, keep the sample ssl_certificate paths
+# sudo certbot certonly --webroot -w /var/www/certbot -d pair.example.com
+# (ensure the ACME location in the sample config matches)
+
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**Optional HTTP basic auth** (owner UI / pairing routes; controller API stays
+on API key only):
+
+```sh
+sudo apt install apache2-utils
+sudo htpasswd -c /etc/nginx/.htpasswd-buzz owner
+sudo chown root:www-data /etc/nginx/.htpasswd-buzz
+sudo chmod 640 /etc/nginx/.htpasswd-buzz
+# Uncomment the two auth_basic* lines in the HTTPS server block of
+# deploy/nginx/pairing-server.conf, then:
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**4. Verify**
+
+```sh
+curl -sS https://pair.example.com/api/health
+# open https://pair.example.com/ in a browser and complete a pair
+```
+
+**5. Day-2 operations**
+
+```sh
+cd /opt/buzz-lightyear
+sudo -u buzz git pull          # or your update process
+sudo -u buzz uv sync --no-default-groups
+sudo systemctl restart buzz-pairing
+
+journalctl -u buzz-pairing -f
+sudo tail -f /var/log/nginx/buzz-pairing.access.log
+```
+
+Pair state on the host is `pairing_state.json` in the project directory (or
+`PAIRING_STATE_PATH` if you set it in the unit / `.env`).
+
+**Manual production command** (same process model without systemd):
+
+```sh
+uv run gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 webapp.wsgi:app
+```
+
+---
+
+### After either option
+
+1. Open `https://<your-domain>/` as the device owner → **Pair with Lovense** → scan with **Lovense Connect**.
+2. On each controller machine:
+
+   ```env
+   LOVENSE_TOKEN=…                 # same developer token as the server
+   PAIRING_SERVER_URL=https://pair.example.com
+   CONTROLLER_API_KEY=…            # same as server
+   ```
+
+   ```sh
+   uv sync
+   uv run python controller_gui.py
+   # Connection tab: Test / Fetch identity
+   ```
+
+3. Confirm identity without the GUI:
+
+   ```sh
+   curl -sS -H "Authorization: Bearer $CONTROLLER_API_KEY" \
+     https://pair.example.com/api/controller/identity
+   ```
+
+## Security notes
+
+* Put the pairing site behind **HTTPS** on the public internet (see deploy options above).
+* `CONTROLLER_API_KEY` should be long and random; treat it like a password.
+* Developer token stays on servers/controllers you control—never in the QR page JS.
+* The controller identity API intentionally **does not** return `LOVENSE_TOKEN`.
+* Prefer binding the app to **127.0.0.1** and letting Caddy/nginx own ports 80/443.
+* Keep **gunicorn `--workers 1`** so in-memory pairing sessions stay consistent.
 
 ## ESP32 motion (UDP over Wi-Fi)
 
