@@ -143,6 +143,42 @@ def _decode_one_socketio_packet(encoded: str) -> tuple[Any, int, int]:
     return pkt, attachment_count, consumed
 
 
+def _skip_harmless_socket_remainder(remaining: str) -> str | None:
+    """
+    Drop known-harmless trailing fragments from Lovense multi-packet frames.
+
+    After a valid packet they sometimes append ``,"Invalid namespace"`` (not a
+    full Socket.IO packet). That is noise about a secondary namespace probe;
+    the default ``/`` namespace still works (device info / app online continue).
+
+    Returns the trimmed remainder, or ``None`` if the whole remainder should be
+    discarded without further warnings.
+    """
+    text = remaining.lstrip()
+    if not text:
+        return ""
+
+    # ,"Invalid namespace"  or  ,"Invalid namespace"<more>
+    if text.startswith(","):
+        rest = text[1:].lstrip()
+        if rest.startswith('"Invalid namespace"') or rest.startswith(
+            "'Invalid namespace'"
+        ):
+            try:
+                _, idx = json.JSONDecoder().raw_decode(rest)
+                return rest[idx:].lstrip()
+            except json.JSONDecodeError:
+                return ""
+        if rest.lower().startswith("invalid namespace"):
+            return ""
+
+    # Bare leftover without a leading packet type digit
+    if not text[0].isdigit() and "invalid namespace" in text[:48].lower():
+        return ""
+
+    return remaining
+
+
 def _make_resilient_socketio_client(**kwargs: Any) -> Any:
     """
     python-socketio Client that tolerates Lovense multi-packet Engine.IO frames.
@@ -184,11 +220,24 @@ def _make_resilient_socketio_client(**kwargs: Any) -> Any:
             for _ in range(32):
                 if not remaining:
                     return
+
+                skipped = _skip_harmless_socket_remainder(remaining)
+                if skipped is None or skipped == "":
+                    return
+                if skipped is not remaining:
+                    remaining = skipped
+                    if not remaining:
+                        return
+
                 try:
                     pkt, attachment_count, consumed = _decode_one_socketio_packet(
                         remaining
                     )
                 except Exception as exc:  # noqa: BLE001
+                    # Second chance: remainder may be noise we did not recognize.
+                    cleaned = _skip_harmless_socket_remainder(remaining)
+                    if cleaned is None or cleaned == "" or cleaned != remaining:
+                        return
                     print(
                         f"  [warn] socket packet decode failed: {exc} "
                         f"prefix={remaining[:64]!r}",
@@ -219,14 +268,20 @@ def _make_resilient_socketio_client(**kwargs: Any) -> Any:
                 ):
                     pkt.attachment_count = attachment_count
                     self._binary_packet = pkt
-                    if remaining:
-                        print(
-                            "  [warn] trailing data after binary packet header; "
-                            f"prefix={remaining[:64]!r}",
-                            file=sys.stderr,
-                        )
+                    # Binary payload(s) arrive in subsequent Engine.IO messages.
+                    # Trailing text in this frame is almost always noise.
                     return
                 elif pkt.packet_type == socketio_packet.CONNECT_ERROR:
+                    # Lovense occasionally errors a non-default namespace; ignore.
+                    err = pkt.data
+                    if isinstance(err, str) and "invalid namespace" in err.lower():
+                        continue
+                    if (
+                        isinstance(err, dict)
+                        and "invalid namespace"
+                        in str(err.get("message", "")).lower()
+                    ):
+                        continue
                     self._handle_error(pkt.namespace, pkt.data)
                 else:
                     print(
