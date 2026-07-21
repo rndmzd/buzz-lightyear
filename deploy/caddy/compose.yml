@@ -1,0 +1,88 @@
+# Buzz Lightyear — pairing server behind Caddy (auto HTTPS).
+#
+# From repo root:
+#   cp .env.example .env   # fill LOVENSE_TOKEN, CONTROLLER_API_KEY, LOVENSE_PLATFORM
+#   # also set PAIRING_DOMAIN=pair.example.com (public DNS A/AAAA → this host)
+#   docker compose -f deploy/caddy/compose.yml up -d --build
+#
+# Controllers:
+#   PAIRING_SERVER_URL=https://pair.example.com
+#
+# Local smoke test (HTTP on :80, Caddy may use internal TLS for localhost):
+#   PAIRING_DOMAIN=localhost docker compose -f deploy/caddy/compose.yml up --build
+#
+# Logs:
+#   docker compose -f deploy/caddy/compose.yml logs -f
+#
+# Stop:
+#   docker compose -f deploy/caddy/compose.yml down
+
+name: buzz-pairing
+
+services:
+  pairing:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: buzz-pairing:local
+    restart: unless-stopped
+    # Optional: copy secrets from repo-root .env (compose also reads shell/.env for ${VAR})
+    env_file:
+      - path: ../../.env
+        required: false
+    environment:
+      WEB_HOST: "0.0.0.0"
+      WEB_PORT: "8080"
+      WEB_DEBUG: "0"
+      PAIRING_STATE_PATH: /data/pairing_state.json
+      # Prefer compose/env_file secrets; do not bake tokens into the image.
+      LOVENSE_TOKEN: ${LOVENSE_TOKEN:-}
+      LOVENSE_PLATFORM: ${LOVENSE_PLATFORM:-Rys Circus}
+      LOVENSE_UNAME: ${LOVENSE_UNAME:-BuzzLightyear}
+      CONTROLLER_API_KEY: ${CONTROLLER_API_KEY:-}
+    volumes:
+      - pairing_data:/data
+    expose:
+      - "8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - edge
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      pairing:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      PAIRING_DOMAIN: ${PAIRING_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+
+volumes:
+  pairing_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  edge:
+    driver: bridge

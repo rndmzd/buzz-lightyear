@@ -1,6 +1,13 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
 #include <Wire.h>
 #include <math.h>
+#include <string.h>
+
+#include "credentials_store.h"
+#include "setup_mode.h"
+#include "wifi_config.h"
 
 namespace {
 
@@ -39,11 +46,41 @@ constexpr uint8_t kRegWhoAmI = 0x75;
 // ±500 degrees/second: 65.5 LSB per degree/second.
 constexpr float kGyroLsbPerDps = 65.5f;
 
+// ---------------------------------------------------------------------------
+// UDP packet format (fixed 16 bytes, little-endian on the wire)
+//
+// Offset  Size  Type     Field
+// 0       4     uint32   protocol_id  = kProtocolId (0x425A5531, "BZU1")
+// 4       4     uint32   sequence     (increments per successful sample)
+// 8       4     uint32   timestamp_us (ESP32 micros() at sample time)
+// 12      4     float    value        (normalized 0.0–1.0, IEEE-754 LE)
+// ---------------------------------------------------------------------------
+constexpr uint32_t kProtocolId = 0x425A5531u;  // 'B','Z','U','1' as LE u32
+constexpr size_t kPacketSize = 16;
+
 uint8_t mpuAddress = 0;
 float gyroBiasDps = 0.0f;
 float filteredGyroDps = 0.0f;
 float filterAlpha = 0.0f;
 uint32_t nextSampleUs = 0;
+
+DeviceNetworkConfig networkConfig{};
+WiFiUDP udp;
+IPAddress udpHostIp;
+bool udpHostResolved = false;
+bool wifiWasConnected = false;
+uint32_t nextWifiAttemptMs = 0;
+uint32_t nextStatusMs = 0;
+uint32_t doubleResetClearMs = 0;
+bool doubleResetWindowOpen = false;
+
+uint32_t sampleSequence = 0;
+uint32_t packetsSent = 0;
+uint32_t sendFailures = 0;
+uint32_t sensorReadFailures = 0;
+uint32_t lastReportedSent = 0;
+uint32_t lastReportedSendFail = 0;
+uint32_t lastReportedSensorFail = 0;
 
 bool writeRegister(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(mpuAddress);
@@ -171,11 +208,190 @@ float calculateNormalizedOutput(float rawGyroDps) {
   }
 }
 
+// Explicit little-endian writers — independent of host/compiler struct layout.
+void writeU32Le(uint8_t* dest, uint32_t value) {
+  dest[0] = static_cast<uint8_t>(value & 0xFFu);
+  dest[1] = static_cast<uint8_t>((value >> 8) & 0xFFu);
+  dest[2] = static_cast<uint8_t>((value >> 16) & 0xFFu);
+  dest[3] = static_cast<uint8_t>((value >> 24) & 0xFFu);
+}
+
+void writeF32Le(uint8_t* dest, float value) {
+  uint32_t bits = 0;
+  static_assert(sizeof(float) == 4, "float must be 32-bit IEEE-754");
+  memcpy(&bits, &value, sizeof(bits));
+  writeU32Le(dest, bits);
+}
+
+void packSamplePacket(uint8_t out[kPacketSize],
+                      uint32_t sequence,
+                      uint32_t timestampUs,
+                      float value) {
+  writeU32Le(out + 0, kProtocolId);
+  writeU32Le(out + 4, sequence);
+  writeU32Le(out + 8, timestampUs);
+  writeF32Le(out + 12, value);
+}
+
+bool resolveUdpHost() {
+  if (!udpHostIp.fromString(networkConfig.udpHost)) {
+    Serial.print("ERROR: Invalid UDP host IP: ");
+    Serial.println(networkConfig.udpHost);
+    udpHostResolved = false;
+    return false;
+  }
+  udpHostResolved = true;
+  return true;
+}
+
+void startWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // lower latency; no modem power-save idle
+  WiFi.begin(networkConfig.ssid, networkConfig.password);
+  nextWifiAttemptMs = millis() + WIFI_RECONNECT_INTERVAL_MS;
+  Serial.print("Wi-Fi: connecting to SSID \"");
+  Serial.print(networkConfig.ssid);
+  Serial.println("\"…");
+}
+
+// Non-blocking: at most one begin() per reconnect interval.
+void maintainWifi() {
+  const bool connected = (WiFi.status() == WL_CONNECTED);
+  const uint32_t nowMs = millis();
+
+  if (connected) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      Serial.print("Wi-Fi: connected, IP ");
+      Serial.println(WiFi.localIP());
+      Serial.print("UDP destination ");
+      Serial.print(networkConfig.udpHost);
+      Serial.print(":");
+      Serial.println(networkConfig.udpPort);
+    }
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    Serial.println("Wi-Fi: disconnected — sampling continues; will retry");
+  }
+
+  if (static_cast<int32_t>(nowMs - nextWifiAttemptMs) >= 0) {
+    nextWifiAttemptMs = nowMs + WIFI_RECONNECT_INTERVAL_MS;
+    Serial.println("Wi-Fi: reconnect attempt…");
+    WiFi.disconnect();
+    WiFi.begin(networkConfig.ssid, networkConfig.password);
+  }
+}
+
+// Fire-and-forget: no ACK wait. Returns false if not connected or send failed.
+bool sendSampleUdp(uint32_t sequence, uint32_t timestampUs, float value) {
+  if (WiFi.status() != WL_CONNECTED || !udpHostResolved) {
+    return false;
+  }
+
+  uint8_t packet[kPacketSize];
+  packSamplePacket(packet, sequence, timestampUs, value);
+
+  if (!udp.beginPacket(udpHostIp, networkConfig.udpPort)) {
+    return false;
+  }
+  const size_t written = udp.write(packet, kPacketSize);
+  if (written != kPacketSize) {
+    udp.endPacket();
+    return false;
+  }
+  // endPacket() is best-effort on ESP32 UDP; do not block for delivery.
+  if (!udp.endPacket()) {
+    return false;
+  }
+  return true;
+}
+
+void maybePrintStatus() {
+  if (SERIAL_STATUS_INTERVAL_MS == 0) {
+    return;
+  }
+  const uint32_t nowMs = millis();
+  if (static_cast<int32_t>(nowMs - nextStatusMs) < 0) {
+    return;
+  }
+  nextStatusMs = nowMs + SERIAL_STATUS_INTERVAL_MS;
+
+  const uint32_t sentDelta = packetsSent - lastReportedSent;
+  const uint32_t sendFailDelta = sendFailures - lastReportedSendFail;
+  const uint32_t sensorFailDelta = sensorReadFailures - lastReportedSensorFail;
+  lastReportedSent = packetsSent;
+  lastReportedSendFail = sendFailures;
+  lastReportedSensorFail = sensorReadFailures;
+
+  Serial.print("status: wifi=");
+  Serial.print(WiFi.status() == WL_CONNECTED ? "up" : "down");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(" ip=");
+    Serial.print(WiFi.localIP());
+  }
+  Serial.print(" sent+");
+  Serial.print(sentDelta);
+  Serial.print(" send_fail+");
+  Serial.print(sendFailDelta);
+  Serial.print(" sensor_fail+");
+  Serial.print(sensorFailDelta);
+  Serial.print(" seq=");
+  Serial.println(sampleSequence);
+}
+
+void maybeClearDoubleResetWindow() {
+  if (!doubleResetWindowOpen) {
+    return;
+  }
+  if (static_cast<int32_t>(millis() - doubleResetClearMs) >= 0) {
+    clearDoubleResetWindow();
+    doubleResetWindowOpen = false;
+    Serial.println("Double-reset window closed (single RST will not enter setup)");
+  }
+}
+
 }  // namespace
 
 void setup() {
   Serial.begin(kSerialBaud);
-  delay(1000);
+  delay(200);
+  statusLedInit();
+
+  // Double RST (within DOUBLE_RESET_WINDOW_MS) forces setup even if NVS is set.
+  const bool doubleReset = consumeDoubleResetRequest();
+  const bool haveCredentials = loadNetworkConfig(&networkConfig);
+
+  if (doubleReset) {
+    Serial.println("Double-reset detected — entering setup mode");
+    runSetupMode(networkConfig);
+  }
+  if (!haveCredentials) {
+    Serial.println("No Wi-Fi credentials in flash — entering setup mode");
+    runSetupMode(networkConfig);
+  }
+
+  // Arm expiry for the double-reset window opened by this normal boot.
+  doubleResetWindowOpen = true;
+  doubleResetClearMs = millis() + DOUBLE_RESET_WINDOW_MS;
+
+  Serial.print("Loaded SSID=\"");
+  Serial.print(networkConfig.ssid);
+  Serial.print("\" UDP ");
+  Serial.print(networkConfig.udpHost);
+  Serial.print(":");
+  Serial.println(networkConfig.udpPort);
+
+  if (!resolveUdpHost()) {
+    // Still allow sensor bring-up for local Serial debugging.
+    Serial.println("WARNING: UDP host IP invalid; packets will not be sent");
+  }
+
+  startWifi();
+  // begin() allocates a local ephemeral port for the UDP socket.
+  udp.begin(0);
 
   Wire.begin(kSdaPin, kSclPin, kI2cClockHz);
   Wire.setTimeOut(20);
@@ -198,19 +414,46 @@ void setup() {
   }
 
   nextSampleUs = micros() + kSamplePeriodUs;
+  nextStatusMs = millis() + SERIAL_STATUS_INTERVAL_MS;
+
+  Serial.println("Sensor ready — streaming UDP samples when Wi-Fi is up");
+  Serial.println("Tip: press RST twice within 3s to re-enter setup mode");
 }
 
 void loop() {
+  maybeClearDoubleResetWindow();
+
+  // Service Wi-Fi without delaying the sample schedule.
+  maintainWifi();
+
   waitForNextSample();
 
   float gyroDps = 0.0f;
   if (!readSelectedGyroDps(gyroDps)) {
-    // Do not output a plausible-looking value for a failed sensor read.
+    // Do not emit a plausible-looking value for a failed sensor read.
+    ++sensorReadFailures;
+#if SERIAL_SAMPLE_OUTPUT
     Serial.println("nan");
+#endif
+    maybePrintStatus();
     return;
   }
 
-  // One scalar per line works directly with a terminal, logger, or the Arduino
-  // Serial Plotter. Values are always in the inclusive range 0.0 to 1.0.
-  Serial.println(calculateNormalizedOutput(gyroDps), 4);
+  const float value = calculateNormalizedOutput(gyroDps);
+  const uint32_t timestampUs = micros();
+  ++sampleSequence;
+
+  // Prefer newest data: send immediately or drop; never queue backlog.
+  if (sendSampleUdp(sampleSequence, timestampUs, value)) {
+    ++packetsSent;
+  } else if (WiFi.status() == WL_CONNECTED) {
+    ++sendFailures;
+  }
+
+#if SERIAL_SAMPLE_OUTPUT
+  // Optional debug path — disabled by default to protect 200 Hz timing.
+  Serial.println(value, 4);
+#endif
+
+  maybePrintStatus();
 }

@@ -28,7 +28,12 @@ from config import (
     upsert_env_value,
 )
 
-PAIRING_STATE_PATH = SCRIPT_DIR / "pairing_state.json"
+def pairing_state_path() -> Path:
+    """JSON file for last pair result (override with PAIRING_STATE_PATH for Docker volumes)."""
+    override = env("PAIRING_STATE_PATH")
+    if override:
+        return Path(override)
+    return SCRIPT_DIR / "pairing_state.json"
 
 
 def _utc_now() -> str:
@@ -285,7 +290,9 @@ def _persist_state(session: PairingSession) -> None:
     # Don't store huge raw blobs
     data.pop("raw", None)
     try:
-        PAIRING_STATE_PATH.write_text(
+        path = pairing_state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
@@ -294,10 +301,11 @@ def _persist_state(session: PairingSession) -> None:
 
 
 def _load_state() -> dict[str, Any] | None:
-    if not PAIRING_STATE_PATH.is_file():
+    path = pairing_state_path()
+    if not path.is_file():
         return None
     try:
-        return json.loads(PAIRING_STATE_PATH.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
 

@@ -1,0 +1,71 @@
+# Buzz Lightyear — systemd unit for the pairing server (host install).
+#
+# Pair with nginx TLS termination (deploy/nginx/pairing-server.conf):
+#   app listens on 127.0.0.1:8080; nginx serves https://pair.example.com
+#
+# Install (adjust paths/user first):
+#   cd /opt/buzz-lightyear
+#   uv sync --no-default-groups          # pairing deps only (or plain `uv sync`)
+#   cp .env.example .env && $EDITOR .env # LOVENSE_TOKEN, CONTROLLER_API_KEY, …
+#   sudo useradd --system --home /opt/buzz-lightyear --shell /usr/sbin/nologin buzz
+#   sudo chown -R buzz:buzz /opt/buzz-lightyear
+#   sudo cp deploy/systemd/buzz-pairing.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now buzz-pairing
+#   sudo systemctl status buzz-pairing
+#
+# Logs:
+#   journalctl -u buzz-pairing -f
+#
+# NOTE: --workers 1 is required (in-memory pairing sessions).
+
+[Unit]
+Description=Buzz Lightyear Lovense pairing server
+Documentation=file:///opt/buzz-lightyear/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=buzz
+Group=buzz
+
+# --- Edit these paths if the checkout is not /opt/buzz-lightyear ---
+WorkingDirectory=/opt/buzz-lightyear
+EnvironmentFile=-/opt/buzz-lightyear/.env
+
+# Bind loopback when nginx (or another reverse proxy) terminates TLS.
+Environment=WEB_HOST=127.0.0.1
+Environment=WEB_PORT=8080
+Environment=WEB_DEBUG=0
+# Optional: override pair-state file location (default: ./pairing_state.json)
+# Environment=PAIRING_STATE_PATH=/var/lib/buzz-lightyear/pairing_state.json
+
+# Prefer the project venv created by `uv sync` (avoids depending on a login PATH).
+ExecStart=/opt/buzz-lightyear/.venv/bin/gunicorn \
+    --bind 127.0.0.1:8080 \
+    --workers 1 \
+    --threads 8 \
+    --timeout 60 \
+    --access-logfile - \
+    --error-logfile - \
+    --capture-output \
+    webapp.wsgi:app
+
+Restart=on-failure
+RestartSec=3
+# Give in-flight pair polls a moment to finish on stop.
+TimeoutStopSec=20
+KillMode=mixed
+
+# Hardening (safe defaults for a small public-facing helper)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/buzz-lightyear
+# If you set PAIRING_STATE_PATH outside the checkout, add that dir here too:
+# ReadWritePaths=/opt/buzz-lightyear /var/lib/buzz-lightyear
+
+[Install]
+WantedBy=multi-user.target

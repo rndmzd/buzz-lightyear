@@ -1,0 +1,47 @@
+# Keep the pairing image build context small and free of secrets / host junk.
+
+.git
+.claude
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.pio
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Secrets and local state
+.env
+.env.*
+!.env.example
+pairing_state.json
+
+# Large / irrelevant for the pairing server
+vosk-model*/
+hardware/
+include/
+src/
+tools/
+*.stl
+*.3mf
+*.FCStd
+*.FCBak
+*.png
+*.jpg
+api_info.*
+
+# Docs and other deploy flavors (Caddyfile is not needed in the app image)
+README.md
+README-pio.md
+LICENSE
+deploy/nginx/
+platformio.ini
+triggers.json
+controller_gui.py
+controller_client.py
+voice_trigger.py
+recognition.py
+sensor_stream.py

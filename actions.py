@@ -107,6 +107,38 @@ def build_function_payload(trigger: TriggerAction) -> dict[str, Any]:
     return payload
 
 
+def build_intensity_payload(
+    level: int,
+    *,
+    time_sec: float = 1.0,
+    stop_previous: int = 1,
+    toy: str | None = None,
+) -> dict[str, Any]:
+    """
+    Continuous-style vibration command for sensor streaming.
+
+    ``level`` is clamped to 0–20 (Lovense Function scale). Level 0 uses Stop.
+    ``stopPrevious=1`` replaces any in-progress Function so intensity can track
+    a live stream without stacking commands.
+    """
+    level = max(0, min(20, int(level)))
+    if level <= 0:
+        action = "Stop"
+        time_sec = 0.0
+    else:
+        action = f"Vibrate:{level}"
+    payload: dict[str, Any] = {
+        "command": "Function",
+        "action": action,
+        "timeSec": float(time_sec),
+        "stopPrevious": int(stop_previous),
+        "apiVer": 1,
+    }
+    if toy:
+        payload["toy"] = toy
+    return payload
+
+
 def fetch_auth_token(
     *,
     token: str,
@@ -119,7 +151,7 @@ def fetch_auth_token(
     """Exchange developer token + uid for a short-lived authToken."""
     if requests is None:
         raise LovenseError(
-            "'requests' is required. Install with: pip install requests"
+            "'requests' is required. Install project deps with: uv sync"
         )
     body: dict[str, Any] = {"token": token, "uid": uid}
     if uname:
@@ -159,7 +191,7 @@ def fetch_socket_endpoint(
     """Return (socketIoUrl, socketIoPath) for Socket.IO connect."""
     if requests is None:
         raise LovenseError(
-            "'requests' is required. Install with: pip install requests"
+            "'requests' is required. Install project deps with: uv sync"
         )
     body = {"platform": platform, "authToken": auth_token}
     try:
@@ -245,7 +277,7 @@ class LovenseSocketClient:
         if socketio is None:
             raise LovenseError(
                 "'python-socketio' is required for the Socket API. "
-                "Install with: pip install 'python-socketio[client]'"
+                "Install project deps with: uv sync"
             )
         if not self.token or not self.uid:
             raise LovenseError(
@@ -405,6 +437,35 @@ class LovenseSocketClient:
             f"  -> socket {EVENT_SEND_COMMAND} for {trigger.phrase!r}: "
             f"{describe_trigger(trigger)}"
         )
+
+    def send_intensity(
+        self,
+        level: int,
+        *,
+        time_sec: float = 1.0,
+        stop_previous: int = 1,
+        toy: str | None = None,
+        test_mode: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Map a 0–20 intensity to a Function command (sensor / continuous control).
+
+        Returns the payload that was (or would be) emitted.
+        """
+        payload = build_intensity_payload(
+            level,
+            time_sec=time_sec,
+            stop_previous=stop_previous,
+            toy=toy,
+        )
+        if test_mode:
+            print(
+                f"  [test] would emit {EVENT_SEND_COMMAND} "
+                f"action={payload.get('action')!r} timeSec={payload.get('timeSec')}"
+            )
+            return payload
+        self.send_function(payload)
+        return payload
 
     def request_qrcode(self, *, ack_id: str | None = None) -> dict[str, Any]:
         """
