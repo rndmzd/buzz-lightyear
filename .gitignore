@@ -22,3 +22,4 @@ venv/
 vosk-model*/
 
 .pio/
+**/*.FCBak
