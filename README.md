@@ -129,7 +129,11 @@ you want to override with a local `LOVENSE_UID` and leave the server URL unset.
 | `actions.py` | Lovense Socket.IO client (commands) |
 | `voice_trigger.py` | Voice controller CLI |
 | `recognition.py` / `triggers.py` | STT + phrase map |
-| `src/main.cpp` | Optional ESP32 motion firmware |
+| `src/main.cpp` | ESP32 motion firmware (MPU6050 → UDP stream) |
+| `include/wifi_config.example.h` | SoftAP / board defaults template (copy to `wifi_config.h`) |
+| `src/setup_mode.cpp` | Double-RST SoftAP setup portal + status LED |
+| `src/credentials_store.cpp` | NVS storage for station Wi-Fi + UDP target |
+| `tools/udp_receiver.py` | Host UDP receiver, stats, optional CSV log |
 
 ## API (pairing server)
 
@@ -153,6 +157,27 @@ examples. On match, emit Function fields via Socket.IO (not HTTP POST).
 * Developer token stays on servers/controllers you control—never in the QR page JS.  
 * The controller identity API intentionally **does not** return `LOVENSE_TOKEN`.  
 
-## ESP32 motion
+## ESP32 motion (UDP over Wi-Fi)
 
-Optional wrist-wave firmware: `README-pio.md` (not wired to controllers yet).
+Optional wrist-wave firmware streams a **0.0–1.0** normalized motion value from
+an MPU6050 to a host PC at **≈200 packets/s** over **UDP** (low latency,
+fire-and-forget; sequence numbers reveal drops). Not wired into the Lovense
+controller path yet.
+
+Full wiring, packet layout, firewall notes, and troubleshooting:
+**[README-pio.md](README-pio.md)**.
+
+```sh
+# 1. Flash firmware
+pio run -t upload
+pio device monitor   # 115200
+
+# 2. Setup mode (first boot, or press RST twice within 3s):
+#    join SoftAP "BuzzLightyear-Setup" → http://192.168.4.1/
+#    enter home Wi-Fi SSID/password + host LAN IP + UDP port → Save
+
+# 3. On the host (same LAN as the ESP32 station), receive samples
+python tools/udp_receiver.py --port 5005
+python tools/udp_receiver.py --port 5005 --csv samples.csv
+python tools/udp_receiver.py --self-test
+```

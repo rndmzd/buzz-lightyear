@@ -4,6 +4,9 @@
 !.env.example
 pairing_state.json
 
+# ESP32 Wi-Fi credentials (use wifi_config.example.h as the template)
+include/wifi_config.h
+
 # Developer dashboard screenshots / dumps
 api_info.jpg
 api_info.*
