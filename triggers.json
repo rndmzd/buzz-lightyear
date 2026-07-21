@@ -1,0 +1,72 @@
+{
+  "defaults": {
+    "action": "Vibrate:16",
+    "timeSec": 5,
+    "cooldown": 3
+  },
+  "triggers": [
+    {
+      "phrase": "to infinity and beyond",
+      "action": "Vibrate:20",
+      "timeSec": 8
+    },
+    {
+      "phrases": ["hey buzz", "hello buzz", "hi buzz"],
+      "action": "Vibrate:10",
+      "timeSec": 3
+    },
+    {
+      "phrases": ["buzz lightyear", "lightyear"],
+      "action": "Vibrate:14",
+      "timeSec": 4
+    },
+    {
+      "phrase": "star command",
+      "action": "Vibrate:18",
+      "timeSec": 6
+    },
+    {
+      "phrases": ["falling with style", "fall with style"],
+      "action": "Vibrate:12",
+      "timeSec": 5
+    },
+    {
+      "phrase": "laser",
+      "action": "Vibrate:20",
+      "timeSec": 2,
+      "cooldown": 1.5
+    },
+    {
+      "phrases": ["gentle", "soft"],
+      "action": "Vibrate:5",
+      "timeSec": 4
+    },
+    {
+      "phrases": ["medium", "medium power"],
+      "action": "Vibrate:12",
+      "timeSec": 5
+    },
+    {
+      "phrases": ["full power", "maximum power", "max power"],
+      "action": "Vibrate:20",
+      "timeSec": 10
+    },
+    {
+      "phrases": ["pulse", "pulse mode"],
+      "action": "Vibrate:15",
+      "timeSec": 8,
+      "cooldown": 5
+    },
+    {
+      "phrases": ["slow down", "ease off"],
+      "action": "Vibrate:6",
+      "timeSec": 6
+    },
+    {
+      "phrases": ["stop", "stop now", "stand down", "cancel"],
+      "action": "Stop",
+      "timeSec": 0,
+      "cooldown": 1
+    }
+  ]
+}

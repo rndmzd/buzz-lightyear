@@ -1,0 +1,236 @@
+:root {
+  --bg: #0f1115;
+  --card: #181b22;
+  --text: #eef1f6;
+  --muted: #9aa3b2;
+  --accent: #ff5a36;
+  --accent-2: #ffc14d;
+  --ok: #3dd68c;
+  --err: #ff6b7a;
+  --border: #2a3040;
+  --focus: #6ea8fe;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #2a1a12 0%, transparent 55%),
+    radial-gradient(900px 500px at 100% 0%, #152238 0%, transparent 50%),
+    var(--bg);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+}
+
+.card {
+  width: min(440px, 100%);
+  background: color-mix(in srgb, var(--card) 92%, black);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 1.75rem 1.5rem 1.5rem;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.eyebrow {
+  margin: 0 0 0.35rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.72rem;
+  color: var(--accent-2);
+  font-weight: 700;
+}
+
+h1 {
+  margin: 0 0 0.6rem;
+  font-size: 1.55rem;
+  line-height: 1.2;
+}
+
+.lede {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+  font-size: 0.95rem;
+}
+
+code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.85em;
+  background: #0c0e13;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.banner {
+  margin-top: 1rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+.banner.error {
+  background: rgba(255, 107, 122, 0.12);
+  border: 1px solid rgba(255, 107, 122, 0.35);
+  color: #ffc0c6;
+}
+
+.form-row {
+  margin-top: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+label {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.optional { opacity: 0.7; }
+
+input[type="text"] {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: #0c0e13;
+  color: var(--text);
+  border-radius: 10px;
+  padding: 0.7rem 0.85rem;
+  font-size: 1rem;
+}
+
+input[type="text"]:focus {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+.actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 1.1rem;
+  flex-wrap: wrap;
+}
+
+button {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.7rem 1.15rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: linear-gradient(135deg, var(--accent), #ff8a3d);
+  color: #1a0b05;
+}
+
+button.primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+button.ghost:hover {
+  color: var(--text);
+  border-color: #3d4660;
+}
+
+.status {
+  margin-top: 1rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+  font-size: 0.92rem;
+  line-height: 1.4;
+  border: 1px solid var(--border);
+  background: #12151c;
+}
+
+.status.idle { color: var(--muted); }
+.status.connecting,
+.status.waiting_for_scan { color: var(--accent-2); border-color: #5a4720; }
+.status.paired { color: var(--ok); border-color: #1f6b48; }
+.status.error { color: var(--err); border-color: #6b2a33; }
+
+.qr-panel {
+  margin-top: 1.25rem;
+  text-align: center;
+}
+
+.qr-frame {
+  display: inline-flex;
+  padding: 0.85rem;
+  background: #fff;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.qr-frame img {
+  display: block;
+  width: min(240px, 70vw);
+  height: auto;
+}
+
+.steps {
+  text-align: left;
+  margin: 1.1rem 0 0.5rem;
+  padding-left: 1.2rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.meta {
+  margin: 0.75rem 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.success-panel {
+  margin-top: 1.25rem;
+  padding: 1rem;
+  border-radius: 12px;
+  background: rgba(61, 214, 140, 0.08);
+  border: 1px solid rgba(61, 214, 140, 0.3);
+}
+
+.success-panel h2 {
+  margin: 0 0 0.4rem;
+  font-size: 1.15rem;
+  color: var(--ok);
+}
+
+.success-panel p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+.device-summary {
+  margin: 0.85rem 0 0;
+  padding: 0.75rem;
+  background: #0c0e13;
+  border-radius: 8px;
+  overflow: auto;
+  font-size: 0.78rem;
+  color: #c5d0e0;
+  max-height: 160px;
+}
+
+.hidden { display: none !important; }

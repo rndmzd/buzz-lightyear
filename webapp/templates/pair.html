@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pair Lovense — Buzz Lightyear</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='pair.css') }}" />
+</head>
+<body>
+  <main class="card">
+    <header>
+      <p class="eyebrow">Buzz Lightyear</p>
+      <h1>Connect your Lovense device</h1>
+      <p class="lede">
+        Pair once with <strong>Lovense Connect</strong> (or Lovense Remote).
+        After scanning, this app stays linked to platform
+        <code>{{ platform }}</code>.
+      </p>
+    </header>
+
+    {% if not has_token %}
+    <div class="banner error" id="config-banner">
+      Server is missing <code>LOVENSE_TOKEN</code>. Set it in the host
+      <code>.env</code> before pairing can work.
+    </div>
+    {% endif %}
+
+    <section class="form-row">
+      <label for="uname">Display name <span class="optional">(optional)</span></label>
+      <input
+        id="uname"
+        type="text"
+        maxlength="64"
+        value="{{ default_uname }}"
+        placeholder="Your nickname"
+        autocomplete="nickname"
+      />
+    </section>
+
+    <div class="actions">
+      <button type="button" id="btn-pair" class="primary" {% if not has_token %}disabled{% endif %}>
+        Pair with Lovense
+      </button>
+      <button type="button" id="btn-reset" class="ghost">Reset session</button>
+    </div>
+
+    <div id="status" class="status idle" role="status" aria-live="polite">
+      Ready when you are.
+    </div>
+
+    <section id="qr-panel" class="qr-panel hidden">
+      <div class="qr-frame">
+        <img id="qr-image" alt="Lovense pairing QR code" />
+      </div>
+      <ol class="steps">
+        <li>Open <strong>Lovense Connect</strong> or <strong>Lovense Remote</strong> on your phone.</li>
+        <li>Use the in-app scanner to scan the QR code above.</li>
+        <li>Keep the app open until status shows <strong>Paired</strong>.</li>
+      </ol>
+      <p class="meta">
+        User id: <code id="uid-label">—</code>
+        <span id="pair-code-wrap" class="hidden"> · Code: <code id="pair-code"></code></span>
+      </p>
+    </section>
+
+    <section id="success-panel" class="success-panel hidden">
+      <h2>You're paired</h2>
+      <p>
+        Authentication is complete for this account. Controllers using the same
+        <code>LOVENSE_UID</code> on the server can now send toy commands over the
+        Socket API.
+      </p>
+      <pre id="device-summary" class="device-summary"></pre>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='pair.js') }}"></script>
+</body>
+</html>

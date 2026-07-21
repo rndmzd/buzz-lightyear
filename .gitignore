@@ -1,0 +1,21 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+pairing_state.json
+
+# Developer dashboard screenshots / dumps
+api_info.jpg
+api_info.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Vosk models (large; download separately)
+vosk-model*/
+
+.pio/
