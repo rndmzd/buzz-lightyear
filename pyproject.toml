@@ -1,0 +1,25 @@
+[project]
+name = "buzz-lightyear"
+version = "0.1.0"
+description = "Voice and sensor triggers for Lovense toys via the Standard Socket API"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0.0",
+    "python-dotenv>=1.0.0",
+    "python-socketio[client]>=5.11.0",
+    "requests>=2.31.0",
+    "websocket-client>=1.6.0",
+]
+
+[dependency-groups]
+# Voice / mic stack for controller machines (not needed on the pairing server).
+controller = [
+    "sounddevice>=0.4.6",
+    "vosk>=0.3.45",
+]
+
+[tool.uv]
+package = false
+# Keep `uv sync` installing voice deps locally; Docker pairing omits default groups.
+default-groups = ["controller"]
