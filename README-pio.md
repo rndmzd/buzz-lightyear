@@ -7,6 +7,14 @@ direction reversal. Direction itself is discarded.
 
 USB Serial remains available for status and optional per-sample debug output.
 
+**Host use:** the controller GUI **Sensor** tab (`controller_gui.py`) receives
+this stream and maps 0–1 samples to continuous Lovense intensity. For packet
+diagnostics without Lovense, use `tools/udp_receiver.py`. Architecture and
+deploy notes: **[README.md](README.md)**.
+
+Printable / CAD enclosure files live under **`hardware/`**
+(`wrist_sensor_case.stl`, `wrist_sensor_lid.stl`, FreeCAD / 3MF sources).
+
 ## Why UDP?
 
 UDP is used for **lowest latency** and a simple fire-and-forget path:
@@ -179,7 +187,25 @@ debugging.
 
 ## Host receiver
 
-Standard library only (no extra Python packages):
+### Lovense control (GUI)
+
+With the controller machine already configured (token + pairing identity — see
+[README.md](README.md)):
+
+```sh
+uv run python controller_gui.py
+# open the Sensor tab → stream starts on UDP 5005 by default
+# Begin control → maps live value to Vibrate:0–20 (rate-limited)
+```
+
+Shared codec and background listener: `sensor_stream.py`
+(`UdpSensorReceiver`, `map_value_to_level`). Optional env knobs:
+`UDP_SENSOR_PORT`, `SENSOR_MAX_LEVEL`, `SENSOR_CMD_HZ`, `SENSOR_DEADBAND`,
+`SENSOR_TIME_SEC`.
+
+### Diagnostics CLI
+
+Uses project deps only (`sensor_stream`); no extra packages beyond `uv sync`:
 
 ```sh
 # Live stream (bind all interfaces, port 5005)
@@ -192,7 +218,7 @@ uv run python tools/udp_receiver.py --port 5005 --quiet --csv samples.csv
 uv run python tools/udp_receiver.py --self-test
 ```
 
-The receiver:
+The CLI receiver:
 
 - Rejects wrong size or protocol id
 - Prints sequence, device timestamp, and value
@@ -227,6 +253,8 @@ the absolute value afterward, which preserves a distinct dip at each reversal.
 | No station Wi-Fi connect | Re-run setup (double-RST); check SSID/password and 2.4 GHz AP |
 | Serial shows IP but host gets nothing | Host firewall UDP port; setup form host IP is the PC’s LAN IP; same subnet |
 | Receiver rejects packets | Port mismatch; wrong firmware; non-16-byte noise on the port |
+| GUI Sensor tab idle / waiting | ESP32 on station Wi-Fi; host port matches setup form; firewall allows UDP |
+| Lovense not connected in Sensor tab | Connection tab: Fetch identity + `LOVENSE_TOKEN`; owner must be paired |
 | Rate ≪ 200 Hz / large gaps | RF interference, AP load, host CPU load, antivirus scanning |
 | Wi-Fi drops | Firmware keeps sampling and reconnects periodically without freezing I2C |
 | `MPU6050 not found` | Wiring SDA/SCL/3V3/GND; address 0x68/0x69; power the module at 3.3 V |

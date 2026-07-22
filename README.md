@@ -1,9 +1,14 @@
 # Buzz Lightyear
 
-Voice (and future) triggers that drive a **Lovense** toy over the
+**Voice** and **wrist-sensor** triggers that drive a **Lovense** toy over the
 **Standard Socket API**, with pairing handled by a separate remote web app.
 
-## Three machines
+| Trigger source | How it runs |
+|----------------|-------------|
+| **Voice** | Vosk offline STT → phrase match in `triggers.json` → Function command |
+| **Sensor** | ESP32 + MPU6050 streams 0–1 motion over UDP → continuous `Vibrate:0–20` |
+
+## Three machines (+ optional wearable)
 
 ```
 ┌──────────────────────────┐     HTTPS      ┌─────────────────────────────┐
@@ -21,10 +26,15 @@ Voice (and future) triggers that drive a **Lovense** toy over the
                                                            │ (never the developer token)
 ┌──────────────────────────┐                               │
 │ Controller computer      │───────────────────────────────┘
-│ voice_trigger / etc.     │
+│ controller_gui / voice   │
 │ · LOVENSE_TOKEN (local)  │──────── Socket.IO commands ──► Lovense cloud
 │ · PAIRING_SERVER_URL     │
 │ · CONTROLLER_API_KEY     │
+└────────────▲─────────────┘
+             │ UDP ~200 Hz (LAN)
+┌────────────┴─────────────┐
+│ ESP32-S3 wrist sensor    │  (optional)
+│ MPU6050 → normalized 0–1 │
 └──────────────────────────┘
 ```
 
@@ -32,7 +42,8 @@ Voice (and future) triggers that drive a **Lovense** toy over the
 |---------|------|
 | **Remote server** | Pairing helper only. Owner opens site, clicks Pair, scans QR. |
 | **Owner phone + PC** | PC shows QR; phone runs Lovense Connect and scans. |
-| **Controller PC** | Runs voice (or other) triggers; talks to Lovense Socket API. |
+| **Controller PC** | Runs GUI and/or voice CLI; talks to Lovense Socket API. |
+| **ESP32 wrist sensor** | Optional. Streams motion over UDP for the GUI **Sensor** tab. |
 
 Pairing binds a **`uid`** to the owner’s Connect app. Controllers do **not**
 scrape the server `.env`. They call a small authenticated API to learn
@@ -92,12 +103,12 @@ Then the controller does its own Socket.IO flow:
 
 1. `getToken` (local token + fetched uid)  
 2. `getSocketUrl` (platform + authToken)  
-3. Emit `basicapi_send_toy_command_ts` on phrase match  
+3. Emit `basicapi_send_toy_command_ts` on phrase match or sensor intensity  
 
 ```sh
 # controller .env: LOVENSE_TOKEN, PAIRING_SERVER_URL, CONTROLLER_API_KEY
 uv sync   # includes voice deps (vosk / sounddevice) via the controller group
-uv run python controller_gui.py          # GUI: connect + fetch identity
+uv run python controller_gui.py          # GUI: identity, voice, sensor
 uv run python voice_trigger.py --model ./vosk-model-small-en-us-0.15
 uv run python voice_trigger.py --model ./vosk-model-small-en-us-0.15 --test
 ```
@@ -115,19 +126,36 @@ Tabs:
 | **Connection** | Pairing server URL, API key, developer token; Test / Fetch identity / Save |
 | **Triggers** | Edit phrase groups → Lovense `action` / `timeSec` / `cooldown`; load/save `triggers.json` |
 | **Voice** | Vosk model + mic; Start/Stop listening; test mode; activity log |
-| **Sensor** | UDP motion stream from ESP32; maps 0–1 values → `Vibrate:0–20` while controlling |
+| **Sensor** | UDP motion from ESP32 → continuous `Vibrate:0–20` (or test-mode log only) |
 
 Voice listening uses the same `TriggerEngine` + Socket.IO path as the CLI.
 Save triggers from the GUI to update `triggers.json` (also used by
 `voice_trigger.py`).
 
-**Sensor tab:** selecting the tab (or **Start stream + Lovense**) binds the UDP
-port (default `5005`) and connects the Socket API when identity + token are
-ready. **Begin control** maps the live stream to continuous vibration
-(rate-limited); **End control** sends Stop.
+#### Sensor tab (ESP32 → Lovense)
+
+Selecting the **Sensor** tab (or **Start stream + Lovense**) binds the UDP
+listen port and connects the Socket API when identity + token are ready.
+**Begin control** maps the live 0–1 stream to intensity; **End control**
+sends `Stop`. Commands use `stopPrevious=1` so each update replaces the
+previous Function instead of stacking.
+
+| Setting | Env (optional) | Default | Purpose |
+|---------|----------------|---------|---------|
+| UDP listen port | `UDP_SENSOR_PORT` | `5005` | Must match the ESP32 setup form |
+| Max vibration level | `SENSOR_MAX_LEVEL` | `20` | Sensor `1.0` → `Vibrate:N` |
+| Command rate (Hz) | `SENSOR_CMD_HZ` | `10` | How often intensity is pushed (not 200 Hz) |
+| Input deadband | `SENSOR_DEADBAND` | `0.02` | Values ≤ this map to level 0 / Stop |
+| Command timeSec | `SENSOR_TIME_SEC` | `1.0` | Duration on each Function emit |
+| Test mode | (GUI only) | off | Map + log only; no Socket emit |
+
+Host-side packet codec and receiver: `sensor_stream.py`. Firmware, wiring,
+and SoftAP setup: **[README-pio.md](README-pio.md)**. Printable enclosure:
+`hardware/`.
 
 You do **not** manually copy `LOVENSE_UID` if `PAIRING_SERVER_URL` is set—unless
-you want to override with a local `LOVENSE_UID` and leave the server URL unset.
+you want a local-only setup: set `LOVENSE_UID` / `LOVENSE_PLATFORM` and leave
+`PAIRING_SERVER_URL` unset.
 
 ## Layout
 
@@ -135,11 +163,13 @@ you want to override with a local `LOVENSE_UID` and leave the server URL unset.
 |------|------|
 | `webapp/` | Owner pairing UI + controller identity API |
 | `pairing.py` | Pairing sessions + `controller_identity()` |
-| `controller_client.py` | Controller fetch of uid/platform |
-| `controller_gui.py` | Controller desktop UI (server link + identity) |
-| `actions.py` | Lovense Socket.IO client (commands) |
+| `controller_client.py` | Controller fetch of uid/platform (+ health) |
+| `controller_gui.py` | Controller desktop UI (identity, triggers, voice, sensor) |
+| `actions.py` | Lovense Socket.IO client (Function + intensity + QR) |
 | `voice_trigger.py` | Voice controller CLI |
-| `recognition.py` / `triggers.py` | STT + phrase map |
+| `recognition.py` / `triggers.py` | STT + phrase map / `TriggerEngine` |
+| `triggers.json` | Phrase → Lovense Function mappings (controller) |
+| `config.py` | Shared paths, defaults, `.env` helpers |
 | `deploy/caddy/` | Docker Compose + Caddy reverse proxy for pairing |
 | `deploy/docker/Dockerfile` | Pairing server container image (gunicorn) |
 | `deploy/systemd/buzz-pairing.service` | Host systemd unit (gunicorn + restart) |
@@ -149,8 +179,11 @@ you want to override with a local `LOVENSE_UID` and leave the server URL unset.
 | `include/wifi_config.example.h` | SoftAP / board defaults template (copy to `wifi_config.h`) |
 | `src/setup_mode.cpp` | Double-RST SoftAP setup portal + status LED |
 | `src/credentials_store.cpp` | NVS storage for station Wi-Fi + UDP target |
-| `sensor_stream.py` | UDP packet codec + threaded receiver (GUI + CLI) |
+| `sensor_stream.py` | UDP packet codec, stats, `UdpSensorReceiver`, level mapping |
 | `tools/udp_receiver.py` | CLI host UDP receiver, stats, optional CSV log |
+| `hardware/` | Wrist sensor enclosure (FreeCAD + STL/3MF) |
+| `platformio.ini` | PlatformIO env for ESP32-S3-Zero |
+| `pyproject.toml` / `uv.lock` | Python deps (`uv sync`; controller group = vosk/mic) |
 
 ## API (pairing server)
 
@@ -159,6 +192,7 @@ you want to override with a local `LOVENSE_UID` and leave the server URL unset.
 | `GET /` | Owner browser | Pair button + QR |
 | `POST /api/pairing/start` | Owner browser | Start QR session |
 | `GET /api/pairing/status` | Owner browser | Poll until paired |
+| `POST /api/pairing/reset` | Owner browser | Drop active pairing socket session |
 | `GET /api/controller/identity` | Controllers | **Bearer / X-Api-Key** → uid, platform, paired |
 | `GET /api/health` | Ops | Liveness (no secrets) |
 
@@ -439,11 +473,14 @@ uv run gunicorn --bind 127.0.0.1:8080 --workers 1 --threads 8 webapp.wsgi:app
 
 Optional wrist-wave firmware streams a **0.0–1.0** normalized motion value from
 an MPU6050 to a host PC at **≈200 packets/s** over **UDP** (low latency,
-fire-and-forget; sequence numbers reveal drops). Not wired into the Lovense
-controller path yet.
+fire-and-forget; sequence numbers reveal drops).
 
-Full wiring, packet layout, firewall notes, and troubleshooting:
-**[README-pio.md](README-pio.md)**.
+On the controller PC, the GUI **Sensor** tab receives that stream and maps it
+to continuous Lovense intensity (`Vibrate:0–20` via Socket.IO). For diagnostics
+without Lovense, use the CLI receiver.
+
+Full wiring, packet layout, SoftAP setup, firewall notes, and troubleshooting:
+**[README-pio.md](README-pio.md)**. Enclosure models: `hardware/`.
 
 ```sh
 # 1. Flash firmware
@@ -454,7 +491,9 @@ pio device monitor   # 115200
 #    join SoftAP "BuzzLightyear-Setup" → http://192.168.4.1/
 #    enter home Wi-Fi SSID/password + host LAN IP + UDP port → Save
 
-# 3. On the host (same LAN as the ESP32 station), receive samples
+# 3. On the host (same LAN as the ESP32 station)
+uv run python controller_gui.py          # Sensor tab → Begin control
+# or diagnostics only:
 uv run python tools/udp_receiver.py --port 5005
 uv run python tools/udp_receiver.py --port 5005 --csv samples.csv
 uv run python tools/udp_receiver.py --self-test
