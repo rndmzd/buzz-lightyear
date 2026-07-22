@@ -153,6 +153,17 @@ Host-side packet codec and receiver: `sensor_stream.py`. Firmware, wiring,
 and SoftAP setup: **[README-pio.md](README-pio.md)**. Printable enclosure:
 `hardware/`.
 
+**Record / replay:** while live UDP is running, **Start recording** writes
+samples to a CSV (`host_timestamp`, `device_timestamp_us`, `sequence`,
+`value` — same schema as `tools/udp_receiver.py --csv`). Later, **Play
+recording** streams that file with original timing (optional loop / speed)
+so you can map motion to Lovense without the ESP32 online. CLI:
+
+```sh
+uv run python tools/udp_receiver.py --port 5005 --csv capture.csv
+uv run python tools/udp_receiver.py --replay capture.csv --speed 1 --loop
+```
+
 You do **not** manually copy `LOVENSE_UID` if `PAIRING_SERVER_URL` is set—unless
 you want a local-only setup: set `LOVENSE_UID` / `LOVENSE_PLATFORM` and leave
 `PAIRING_SERVER_URL` unset.

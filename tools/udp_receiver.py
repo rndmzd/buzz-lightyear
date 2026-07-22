@@ -14,6 +14,7 @@ Examples::
 
     python tools/udp_receiver.py --port 5005
     python tools/udp_receiver.py --port 5005 --csv samples.csv
+    python tools/udp_receiver.py --replay samples.csv --speed 2
     python tools/udp_receiver.py --self-test
 """
 
@@ -23,6 +24,7 @@ import argparse
 import csv
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import TextIO
@@ -33,21 +35,24 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from sensor_stream import (  # noqa: E402
+    CSV_FLUSH_EVERY,
     PACKET_SIZE,
     PROTOCOL_ID,
+    RECORDING_CSV_HEADER,
     RECV_BUFFER_BYTES,
     PacketError,
     SamplePacket,
+    SensorRecorder,
+    SensorReplay,
     StreamStats,
     decode_packet,
     encode_packet,
+    load_recording_csv,
 )
-
-CSV_FLUSH_EVERY = 50
 
 
 def run_self_test() -> int:
-    """Encode/decode round-trip, reject malformed, and sequence-gap checks."""
+    """Encode/decode round-trip, reject malformed, sequence gaps, record/replay."""
     failures = 0
 
     def check(name: str, cond: bool, detail: str = "") -> None:
@@ -112,6 +117,60 @@ def run_self_test() -> int:
         f"mean_jitter_us={stats2.mean_jitter_us():.3f}",
     )
 
+    print("Self-test: record / replay")
+    with tempfile.TemporaryDirectory() as tmp:
+        rec_path = Path(tmp) / "capture.csv"
+        recorder = SensorRecorder(rec_path)
+        base = 1_700_000_000.0
+        for i in range(5):
+            recorder.record(
+                SamplePacket(
+                    protocol_id=PROTOCOL_ID,
+                    sequence=i + 1,
+                    device_timestamp_us=1000 + i * 5000,
+                    value=0.1 * i,
+                ),
+                host_timestamp=base + i * 0.01,
+            )
+        count = recorder.close()
+        check("recorder count", count == 5, f"count={count}")
+        loaded = load_recording_csv(rec_path)
+        check("load sample count", len(loaded) == 5, f"n={len(loaded)}")
+        check(
+            "load last value",
+            abs(loaded[-1].value - 0.4) < 1e-6,
+            f"value={loaded[-1].value}",
+        )
+
+        seen: list[float] = []
+        done = {"ok": False}
+
+        def on_sample(p: SamplePacket) -> None:
+            seen.append(p.value)
+
+        def on_finished() -> None:
+            done["ok"] = True
+
+        player = SensorReplay(
+            loaded,
+            loop=False,
+            speed=100.0,
+            on_sample=on_sample,
+            on_finished=on_finished,
+        )
+        player.start()
+        deadline = time.monotonic() + 3.0
+        while player.running and time.monotonic() < deadline:
+            time.sleep(0.02)
+        player.stop()
+        check("replay sample count", len(seen) == 5, f"seen={len(seen)}")
+        check("replay finished callback", done["ok"])
+        check(
+            "replay last value",
+            abs(seen[-1] - 0.4) < 1e-6 if seen else False,
+            f"seen={seen!r}",
+        )
+
     if failures:
         print(f"Self-test FAILED ({failures} check(s))")
         return 1
@@ -122,9 +181,7 @@ def run_self_test() -> int:
 def open_csv(path: Path) -> tuple[TextIO, csv.writer]:
     fh = path.open("w", newline="", encoding="utf-8")
     writer = csv.writer(fh)
-    writer.writerow(
-        ["host_timestamp", "device_timestamp_us", "sequence", "value"]
-    )
+    writer.writerow(RECORDING_CSV_HEADER)
     fh.flush()
     return fh, writer
 
@@ -232,9 +289,81 @@ def receive_loop(
         sock.close()
 
 
+def replay_loop(
+    *,
+    csv_path: Path,
+    quiet: bool,
+    status_interval: float,
+    loop: bool,
+    speed: float,
+) -> int:
+    """Play a CSV recording to stdout (no UDP / no ESP32 required)."""
+    try:
+        samples = load_recording_csv(csv_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Replaying {csv_path}  samples={len(samples)}  "
+        f"speed={speed:g}×  loop={loop}  (Ctrl+C to stop)"
+    )
+    stats_holder: list[StreamStats | None] = [None]
+    last_status = time.monotonic()
+
+    def on_sample(packet: SamplePacket) -> None:
+        nonlocal last_status
+        if not quiet:
+            print(
+                f"seq={packet.sequence:10d}  "
+                f"ts_us={packet.device_timestamp_us:10d}  "
+                f"value={packet.value:7.4f}  "
+                f"from=replay"
+            )
+        if status_interval > 0:
+            mono = time.monotonic()
+            if (mono - last_status) >= status_interval:
+                st = stats_holder[0]
+                if st is not None:
+                    rate = st.rate_hz(mono)
+                    print(
+                        f"[stats] rate≈{rate:.1f} Hz  recv={st.received}  "
+                        f"gaps={st.gaps}",
+                        file=sys.stderr,
+                    )
+                    st.reset_window(mono)
+                last_status = mono
+
+    player = SensorReplay(
+        samples,
+        loop=loop,
+        speed=speed,
+        on_sample=on_sample,
+        label=str(csv_path),
+    )
+    player.start()
+    try:
+        while player.running:
+            stats_holder[0] = player.stats
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\nStopped.", file=sys.stderr)
+    finally:
+        player.stop()
+    st = player.stats
+    print(
+        f"Totals: recv={st.received} gaps={st.gaps} loops={player.loops_completed}",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Receive Buzz Lightyear ESP32 motion samples over UDP.",
+        description=(
+            "Receive Buzz Lightyear ESP32 motion samples over UDP, "
+            "or replay a CSV recording."
+        ),
     )
     p.add_argument(
         "--host",
@@ -252,7 +381,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=None,
         metavar="PATH",
-        help="Append decoded samples to this CSV file (batched flush).",
+        help="Write decoded live samples to this CSV file (batched flush).",
+    )
+    p.add_argument(
+        "--replay",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Play a CSV recording instead of listening on UDP.",
+    )
+    p.add_argument(
+        "--loop",
+        action="store_true",
+        help="With --replay, repeat the recording until Ctrl+C.",
+    )
+    p.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        metavar="N",
+        help="With --replay, playback rate (1.0 = real-time).",
     )
     p.add_argument(
         "--quiet",
@@ -269,7 +417,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--self-test",
         action="store_true",
-        help="Run encode/decode and stats checks, then exit.",
+        help="Run encode/decode, stats, and record/replay checks, then exit.",
     )
     return p.parse_args(argv)
 
@@ -278,6 +426,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.self_test:
         return run_self_test()
+    if args.replay is not None:
+        return replay_loop(
+            csv_path=args.replay,
+            quiet=args.quiet,
+            status_interval=args.status_interval,
+            loop=args.loop,
+            speed=args.speed,
+        )
     return receive_loop(
         host=args.host,
         port=args.port,

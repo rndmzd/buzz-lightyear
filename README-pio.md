@@ -196,12 +196,14 @@ With the controller machine already configured (token + pairing identity — see
 uv run python controller_gui.py
 # open the Sensor tab → stream starts on UDP 5005 by default
 # Begin control → maps live value to Vibrate:0–20 (rate-limited)
+# Record / replay panel → capture CSV while live, play later without ESP32
 ```
 
 Shared codec and background listener: `sensor_stream.py`
-(`UdpSensorReceiver`, `map_value_to_level`). Optional env knobs:
-`UDP_SENSOR_PORT`, `SENSOR_MAX_LEVEL`, `SENSOR_CMD_HZ`, `SENSOR_DEADBAND`,
-`SENSOR_TIME_SEC`.
+(`UdpSensorReceiver`, `SensorRecorder`, `SensorReplay`, `map_value_to_level`).
+Optional env knobs: `UDP_SENSOR_PORT`, `SENSOR_MAX_LEVEL`, `SENSOR_CMD_HZ`,
+`SENSOR_DEADBAND`, `SENSOR_TIME_SEC`, `SENSOR_RECORD_PATH`,
+`SENSOR_REPLAY_PATH`, `SENSOR_REPLAY_SPEED`.
 
 ### Diagnostics CLI
 
@@ -214,7 +216,11 @@ uv run python tools/udp_receiver.py --port 5005
 # Quiet mode + CSV log (batched flush)
 uv run python tools/udp_receiver.py --port 5005 --quiet --csv samples.csv
 
-# Codec / gap-detection self-test (no hardware)
+# Replay a capture (no hardware)
+uv run python tools/udp_receiver.py --replay samples.csv --speed 1
+uv run python tools/udp_receiver.py --replay samples.csv --loop --speed 2
+
+# Codec / gap-detection / record-replay self-test (no hardware)
 uv run python tools/udp_receiver.py --self-test
 ```
 

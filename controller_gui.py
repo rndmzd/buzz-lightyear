@@ -38,7 +38,11 @@ from controller_client import (
 from recognition import RecognitionError, VoiceListener, list_input_device_choices
 from sensor_stream import (
     DEFAULT_UDP_PORT,
+    RecordingError,
+    SensorRecorder,
+    SensorReplay,
     UdpSensorReceiver,
+    load_recording_csv,
     map_value_to_level,
 )
 from triggers import (
@@ -60,6 +64,7 @@ class TriggerEditDialog(tk.Toplevel):
     def __init__(self, master: tk.Misc, title: str, initial: dict | None = None) -> None:
         super().__init__(master)
         self.title(title)
+        self.configure(bg="#12141a")
         self.resizable(True, False)
         self.transient(master)
         self.grab_set()
@@ -152,8 +157,9 @@ class ControllerApp(tk.Tk):
         self._engine: TriggerEngine | None = None
         self._ui_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
 
-        # Sensor (UDP motion) stream state
-        self._sensor_receiver: UdpSensorReceiver | None = None
+        # Sensor (UDP / replay) stream state
+        self._sensor_receiver: UdpSensorReceiver | SensorReplay | None = None
+        self._sensor_recorder: SensorRecorder | None = None
         self._sensor_control_active = False
         self._sensor_last_level: int | None = None
         self._sensor_last_send_mono = 0.0
@@ -171,40 +177,223 @@ class ControllerApp(tk.Tk):
     # --- style / layout -----------------------------------------------------
 
     def _build_style(self) -> None:
-        self.configure(bg="#12141a")
+        # Full dark palette — clam keeps light defaults for buttons/tabs/etc.
+        # unless every surface + map state is set (light text on light bg otherwise).
+        bg = "#12141a"
+        card = "#1a1e28"
+        field = "#0c0e13"
+        text = "#e8ecf4"
+        muted = "#9aa3b2"
+        accent = "#ffc14d"
+        button = "#2a3142"
+        button_hover = "#3a455c"
+        button_pressed = "#1e2430"
+        button_disabled = "#1a1e28"
+        disabled_fg = "#6b7380"
+        select_bg = "#3d4f73"
+        tab = "#1e2430"
+        tab_selected = "#2a3142"
+        border = "#3a4254"
+
+        self.configure(bg=bg)
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure(".", background="#12141a", foreground="#e8ecf4")
-        style.configure("TFrame", background="#12141a")
-        style.configure("TNotebook", background="#12141a")
-        style.configure("TNotebook.Tab", padding=[12, 6])
-        style.configure("TLabel", background="#12141a", foreground="#e8ecf4")
-        style.configure("Card.TLabel", background="#1a1e28", foreground="#e8ecf4")
-        style.configure("Muted.TLabel", background="#1a1e28", foreground="#9aa3b2")
+
+        style.configure(
+            ".",
+            background=bg,
+            foreground=text,
+            fieldbackground=field,
+            troughcolor=card,
+            bordercolor=border,
+            darkcolor=card,
+            lightcolor=card,
+            insertcolor=text,
+            selectbackground=select_bg,
+            selectforeground=text,
+        )
+        style.configure("TFrame", background=bg)
+        style.configure("Card.TFrame", background=card)
+        style.configure("TNotebook", background=bg, borderwidth=0)
+        style.configure(
+            "TNotebook.Tab",
+            background=tab,
+            foreground=text,
+            padding=[12, 6],
+            borderwidth=1,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", tab_selected), ("active", button_hover)],
+            foreground=[("selected", accent), ("active", text), ("disabled", disabled_fg)],
+        )
+        style.configure("TLabel", background=bg, foreground=text)
+        style.configure("Card.TLabel", background=card, foreground=text)
+        style.configure("Muted.TLabel", background=card, foreground=muted)
         style.configure(
             "Title.TLabel",
-            background="#12141a",
-            foreground="#ffc14d",
+            background=bg,
+            foreground=accent,
             font=("Segoe UI", 14, "bold"),
         )
-        style.configure("TButton", padding=8)
-        style.configure("TEntry", fieldbackground="#0c0e13", foreground="#e8ecf4")
-        style.configure("TLabelframe", background="#1a1e28", foreground="#e8ecf4")
         style.configure(
-            "TLabelframe.Label", background="#1a1e28", foreground="#ffc14d"
+            "TButton",
+            background=button,
+            foreground=text,
+            padding=8,
+            borderwidth=1,
+            focusthickness=1,
+            focuscolor=accent,
+        )
+        style.map(
+            "TButton",
+            background=[
+                ("disabled", button_disabled),
+                ("pressed", button_pressed),
+                ("active", button_hover),
+            ],
+            foreground=[
+                ("disabled", disabled_fg),
+                ("pressed", text),
+                ("active", text),
+            ],
+            bordercolor=[("focus", accent), ("!focus", border)],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=field,
+            foreground=text,
+            insertcolor=text,
+            bordercolor=border,
+            lightcolor=border,
+            darkcolor=border,
+            padding=4,
+        )
+        style.map(
+            "TEntry",
+            fieldbackground=[("disabled", card), ("readonly", card)],
+            foreground=[("disabled", disabled_fg)],
+            bordercolor=[("focus", accent)],
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=field,
+            background=button,
+            foreground=text,
+            arrowcolor=text,
+            bordercolor=border,
+            lightcolor=border,
+            darkcolor=border,
+            padding=4,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[
+                ("readonly", field),
+                ("disabled", card),
+                ("!disabled", field),
+            ],
+            foreground=[
+                ("disabled", disabled_fg),
+                ("readonly", text),
+                ("!disabled", text),
+            ],
+            background=[("active", button_hover), ("!disabled", button)],
+            arrowcolor=[("disabled", disabled_fg), ("!disabled", text)],
+            bordercolor=[("focus", accent), ("!focus", border)],
+        )
+        # Dropdown list (popdown) is a separate tk Listbox; set via option_add.
+        self.option_add("*TCombobox*Listbox.background", field)
+        self.option_add("*TCombobox*Listbox.foreground", text)
+        self.option_add("*TCombobox*Listbox.selectBackground", select_bg)
+        self.option_add("*TCombobox*Listbox.selectForeground", text)
+        # Prefer card bg: most checkbuttons sit inside LabelFrames / card frames.
+        style.configure(
+            "TCheckbutton",
+            background=card,
+            foreground=text,
+            indicatorbackground=field,
+            indicatorforeground=accent,
+            focuscolor=card,
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", card), ("selected", card), ("!disabled", card)],
+            foreground=[("disabled", disabled_fg), ("!disabled", text)],
+            indicatorbackground=[
+                ("selected", button),
+                ("active", field),
+                ("disabled", card),
+            ],
+            indicatorforeground=[("selected", accent), ("!selected", muted)],
+        )
+        style.configure(
+            "TLabelframe",
+            background=card,
+            foreground=text,
+            bordercolor=border,
+            lightcolor=border,
+            darkcolor=border,
+            relief="solid",
+            borderwidth=1,
+        )
+        style.configure(
+            "TLabelframe.Label",
+            background=card,
+            foreground=accent,
         )
         style.configure(
             "Treeview",
-            background="#0c0e13",
-            fieldbackground="#0c0e13",
-            foreground="#e8ecf4",
+            background=field,
+            fieldbackground=field,
+            foreground=text,
+            bordercolor=border,
             rowheight=24,
         )
-        style.configure("Treeview.Heading", background="#1a1e28", foreground="#ffc14d")
-        style.map("TButton", background=[("active", "#2a3142")])
+        style.configure(
+            "Treeview.Heading",
+            background=card,
+            foreground=accent,
+            bordercolor=border,
+            relief="flat",
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", select_bg)],
+            foreground=[("selected", text)],
+        )
+        style.map(
+            "Treeview.Heading",
+            background=[("active", button)],
+            foreground=[("active", accent)],
+        )
+        style.configure(
+            "Vertical.TScrollbar",
+            background=button,
+            troughcolor=card,
+            bordercolor=card,
+            arrowcolor=text,
+        )
+        style.configure(
+            "Horizontal.TScrollbar",
+            background=button,
+            troughcolor=card,
+            bordercolor=card,
+            arrowcolor=text,
+        )
+        style.map(
+            "Vertical.TScrollbar",
+            background=[("active", button_hover), ("disabled", card)],
+            arrowcolor=[("disabled", disabled_fg)],
+        )
+        style.map(
+            "Horizontal.TScrollbar",
+            background=[("active", button_hover), ("disabled", card)],
+            arrowcolor=[("disabled", disabled_fg)],
+        )
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=12)
@@ -262,7 +451,7 @@ class ControllerApp(tk.Tk):
         )
         self._row_entry(conn, 3, "Request timeout (s)", self.var_timeout)
 
-        btn_row = ttk.Frame(conn)
+        btn_row = ttk.Frame(conn, style="Card.TFrame")
         btn_row.grid(row=4, column=0, columnspan=2, sticky=tk.EW, pady=(12, 0))
         ttk.Button(btn_row, text="Test connection", command=self.on_test).pack(
             side=tk.LEFT, padx=(0, 8)
@@ -296,7 +485,7 @@ class ControllerApp(tk.Tk):
         ttk.Label(ident, text="Raw response", style="Muted.TLabel").grid(
             row=6, column=0, sticky=tk.NW, pady=(10, 0)
         )
-        raw_frame = ttk.Frame(ident)
+        raw_frame = ttk.Frame(ident, style="Card.TFrame")
         raw_frame.grid(row=6, column=1, sticky=tk.NSEW, pady=(10, 0))
         ident.columnconfigure(1, weight=1)
         ident.rowconfigure(6, weight=1)
@@ -408,7 +597,7 @@ class ControllerApp(tk.Tk):
         )
         cfg.columnconfigure(1, weight=1)
 
-        opts = ttk.Frame(cfg)
+        opts = ttk.Frame(cfg, style="Card.TFrame")
         opts.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
         ttk.Checkbutton(
             opts, text="Test mode (log only, no Lovense emit)",
@@ -455,7 +644,8 @@ class ControllerApp(tk.Tk):
             parent,
             text="Selecting this tab starts the UDP receiver and connects to the "
             "Lovense Socket API (when identity + token are ready). Press "
-            "Begin control to map the live 0–1 motion stream to vibration.",
+            "Begin control to map the live 0–1 motion stream to vibration. "
+            "Record live samples to CSV and replay them later without an ESP32.",
             wraplength=760,
         )
         intro.pack(anchor=tk.W, pady=(0, 8))
@@ -518,17 +708,20 @@ class ControllerApp(tk.Tk):
             value="recv=0  rate=—  gaps=0  cmds=0"
         )
 
-        ttk.Label(status, textvariable=self.var_sensor_stream).pack(anchor=tk.W)
-        ttk.Label(status, textvariable=self.var_sensor_lovense).pack(anchor=tk.W)
-        ttk.Label(status, textvariable=self.var_sensor_control).pack(anchor=tk.W)
-        ttk.Label(status, textvariable=self.var_sensor_value).pack(anchor=tk.W)
-        ttk.Label(status, textvariable=self.var_sensor_level).pack(anchor=tk.W)
-        ttk.Label(status, textvariable=self.var_sensor_stats).pack(
-            anchor=tk.W, pady=(4, 0)
-        )
+        for var in (
+            self.var_sensor_stream,
+            self.var_sensor_lovense,
+            self.var_sensor_control,
+            self.var_sensor_value,
+            self.var_sensor_level,
+        ):
+            ttk.Label(status, textvariable=var, style="Card.TLabel").pack(anchor=tk.W)
+        ttk.Label(
+            status, textvariable=self.var_sensor_stats, style="Card.TLabel"
+        ).pack(anchor=tk.W, pady=(4, 0))
 
         # Simple value bar (Canvas)
-        bar_frame = ttk.Frame(status)
+        bar_frame = ttk.Frame(status, style="Card.TFrame")
         bar_frame.pack(fill=tk.X, pady=(8, 0))
         self._sensor_bar = tk.Canvas(
             bar_frame, height=18, bg="#0c0e13", highlightthickness=0
@@ -566,6 +759,79 @@ class ControllerApp(tk.Tk):
         )
         self.btn_sensor_stop.pack(side=tk.LEFT)
 
+        rec = ttk.LabelFrame(parent, text="Record / replay", padding=12)
+        rec.pack(fill=tk.X, pady=(0, 8))
+
+        self.var_record_path = tk.StringVar(
+            value=env("SENSOR_RECORD_PATH", "sensor_capture.csv")
+            or "sensor_capture.csv"
+        )
+        self.var_replay_path = tk.StringVar(
+            value=env("SENSOR_REPLAY_PATH", "sensor_capture.csv")
+            or "sensor_capture.csv"
+        )
+        self.var_replay_speed = tk.StringVar(
+            value=env("SENSOR_REPLAY_SPEED", "1.0") or "1.0"
+        )
+        self.var_replay_loop = tk.BooleanVar(value=False)
+        self.var_record_status = tk.StringVar(value="Recording: off")
+
+        self._row_entry(
+            rec, 0, "Record to CSV", self.var_record_path,
+            hint="Live UDP samples only (same columns as tools/udp_receiver.py)",
+        )
+        ttk.Button(rec, text="Browse…", command=self.on_browse_record_path).grid(
+            row=0, column=2, padx=(8, 0), sticky=tk.N, pady=4
+        )
+
+        rec_btns = ttk.Frame(rec, style="Card.TFrame")
+        rec_btns.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=(4, 8))
+        self.btn_record_start = ttk.Button(
+            rec_btns, text="Start recording", command=self.on_record_start
+        )
+        self.btn_record_start.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_record_stop = ttk.Button(
+            rec_btns,
+            text="Stop recording",
+            command=self.on_record_stop,
+            state=tk.DISABLED,
+        )
+        self.btn_record_stop.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            rec_btns, textvariable=self.var_record_status, style="Card.TLabel"
+        ).pack(side=tk.LEFT)
+
+        self._row_entry(
+            rec, 2, "Replay from CSV", self.var_replay_path,
+            hint="Plays timed samples without binding UDP / needing the ESP32",
+        )
+        ttk.Button(rec, text="Browse…", command=self.on_browse_replay_path).grid(
+            row=2, column=2, padx=(8, 0), sticky=tk.N, pady=4
+        )
+        self._row_entry(
+            rec, 3, "Replay speed", self.var_replay_speed,
+            hint="1.0 = real-time, 2.0 = twice as fast",
+        )
+        ttk.Checkbutton(
+            rec,
+            text="Loop replay",
+            variable=self.var_replay_loop,
+        ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
+
+        replay_btns = ttk.Frame(rec, style="Card.TFrame")
+        replay_btns.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        self.btn_replay_start = ttk.Button(
+            replay_btns, text="Play recording", command=self.on_replay_start
+        )
+        self.btn_replay_start.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_replay_stop = ttk.Button(
+            replay_btns,
+            text="Stop replay",
+            command=self.on_replay_stop,
+            state=tk.DISABLED,
+        )
+        self.btn_replay_stop.pack(side=tk.LEFT)
+
         log_box = ttk.LabelFrame(parent, text="Sensor activity", padding=8)
         log_box.pack(fill=tk.BOTH, expand=True)
         self.txt_sensor_log = tk.Text(
@@ -596,7 +862,11 @@ class ControllerApp(tk.Tk):
         ttk.Label(parent, text=label, style="Card.TLabel").grid(
             row=row, column=0, sticky=tk.W, pady=4, padx=(0, 12)
         )
-        cell = ttk.Frame(parent)
+        # Match LabelFrame card surface so labels/entries don't sit on a mismatched strip.
+        cell_style = (
+            "Card.TFrame" if isinstance(parent, ttk.LabelFrame) else "TFrame"
+        )
+        cell = ttk.Frame(parent, style=cell_style)
         cell.grid(row=row, column=1, sticky=tk.EW, pady=4)
         parent.columnconfigure(1, weight=1)
         ttk.Entry(cell, textvariable=variable, show=show or "").pack(fill=tk.X)
@@ -717,6 +987,8 @@ class ControllerApp(tk.Tk):
                 elif kind == "sensor_error":
                     self._sensor_log(f"ERROR: {payload}")
                     self.var_sensor_stream.set("UDP: error")
+                elif kind == "sensor_replay_finished":
+                    self._on_replay_finished_ui()
                 elif kind == "listening_stopped":
                     self._set_listening_ui(False)
         except queue.Empty:
@@ -1150,8 +1422,21 @@ class ControllerApp(tk.Tk):
         except tk.TclError:
             return
         if title == "Sensor":
+            # Do not steal the stream if a CSV replay is already running.
+            if isinstance(self._sensor_receiver, SensorReplay):
+                return
             # Selecting the Sensor tab starts UDP + Lovense (idempotent).
             self.after(50, lambda: self.on_sensor_start(from_tab=True))
+
+    def _sensor_is_live_udp(self) -> bool:
+        return isinstance(self._sensor_receiver, UdpSensorReceiver) and bool(
+            self._sensor_receiver.running
+        )
+
+    def _sensor_is_replay(self) -> bool:
+        return isinstance(self._sensor_receiver, SensorReplay) and bool(
+            self._sensor_receiver.running
+        )
 
     def _sensor_parse_port(self) -> int:
         try:
@@ -1188,6 +1473,10 @@ class ControllerApp(tk.Tk):
         }
 
     def _set_sensor_stream_ui(self, running: bool) -> None:
+        replaying = self._sensor_is_replay()
+        live_udp = self._sensor_is_live_udp()
+        recording = self._sensor_recorder is not None and not self._sensor_recorder.closed
+
         self.btn_sensor_start.configure(
             state=tk.DISABLED if running else tk.NORMAL
         )
@@ -1200,9 +1489,50 @@ class ControllerApp(tk.Tk):
         self.btn_sensor_end.configure(
             state=tk.NORMAL if self._sensor_control_active else tk.DISABLED
         )
+        # Record only while live UDP is up; replay is exclusive of live stream.
+        self.btn_record_start.configure(
+            state=tk.NORMAL if live_udp and not recording else tk.DISABLED
+        )
+        self.btn_record_stop.configure(
+            state=tk.NORMAL if recording else tk.DISABLED
+        )
+        self.btn_replay_start.configure(
+            state=tk.DISABLED if running else tk.NORMAL
+        )
+        self.btn_replay_stop.configure(
+            state=tk.NORMAL if replaying else tk.DISABLED
+        )
+
+    def _stop_sensor_recorder(self, *, log: bool = True) -> None:
+        rec = self._sensor_recorder
+        self._sensor_recorder = None
+        if rec is None:
+            self.var_record_status.set("Recording: off")
+            return
+        try:
+            count = rec.close()
+        except Exception as exc:  # noqa: BLE001
+            if log:
+                self._sensor_log(f"Recorder close failed: {exc}")
+            count = rec.count
+        self.var_record_status.set("Recording: off")
+        if log:
+            self._sensor_log(
+                f"Recording stopped → {rec.path} ({count} sample(s))."
+            )
 
     def on_sensor_start(self, *, from_tab: bool = False) -> None:
         """Start UDP receiver and connect Lovense Socket API."""
+        if isinstance(self._sensor_receiver, SensorReplay) and self._sensor_receiver.running:
+            if from_tab:
+                return
+            if not messagebox.askyesno(
+                "Sensor",
+                "A CSV replay is running. Stop it and start the live UDP stream?",
+            ):
+                return
+            self.on_replay_stop()
+
         if self._sensor_receiver is not None and self._sensor_receiver.running:
             if not from_tab:
                 self._sensor_log("UDP stream already running.")
@@ -1222,10 +1552,19 @@ class ControllerApp(tk.Tk):
         def on_error(msg: str) -> None:
             self._queue_ui("sensor_error", msg)
 
+        def on_sample(packet: Any) -> None:
+            rec = self._sensor_recorder
+            if rec is not None and not rec.closed:
+                try:
+                    rec.record(packet)
+                except Exception:  # noqa: BLE001
+                    pass
+
         try:
             receiver = UdpSensorReceiver(
                 host="0.0.0.0",
                 port=port,
+                on_sample=on_sample,
                 on_error=on_error,
             )
             receiver.start()
@@ -1293,25 +1632,182 @@ class ControllerApp(tk.Tk):
     def on_sensor_stop(self) -> None:
         if self._sensor_control_active:
             self.on_sensor_end_control()
+        self._stop_sensor_recorder(log=True)
+        was_replay = isinstance(self._sensor_receiver, SensorReplay)
         if self._sensor_receiver is not None:
             try:
                 self._sensor_receiver.stop()
             except Exception:  # noqa: BLE001
                 pass
             self._sensor_receiver = None
-        self.var_sensor_stream.set("UDP: stopped")
+        self.var_sensor_stream.set("Replay: stopped" if was_replay else "UDP: stopped")
         self.var_sensor_control.set("Control: idle")
         self.var_sensor_value.set("Value: —")
         self.var_sensor_level.set("Level: —")
         self._set_sensor_stream_ui(False)
-        self._sensor_log("UDP stream stopped.")
+        self._sensor_log("Replay stopped." if was_replay else "UDP stream stopped.")
+
+    def on_browse_record_path(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Record sensor CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+            initialfile=Path(self.var_record_path.get() or "sensor_capture.csv").name,
+        )
+        if path:
+            self.var_record_path.set(path)
+
+    def on_browse_replay_path(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open sensor recording",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if path:
+            self.var_replay_path.set(path)
+
+    def on_record_start(self) -> None:
+        if not self._sensor_is_live_udp():
+            messagebox.showwarning(
+                "Record",
+                "Start the live UDP stream first, then start recording.",
+            )
+            return
+        if self._sensor_recorder is not None and not self._sensor_recorder.closed:
+            self._sensor_log("Already recording.")
+            return
+        path_text = (self.var_record_path.get() or "").strip()
+        if not path_text:
+            messagebox.showwarning("Record", "Choose a CSV path for the recording.")
+            return
+        path = Path(path_text).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            self._sensor_recorder = SensorRecorder(path)
+        except OSError as exc:
+            messagebox.showerror("Record", f"Could not open {path}: {exc}")
+            return
+        self.var_record_path.set(str(path))
+        upsert_env_value(ENV_PATH, "SENSOR_RECORD_PATH", str(path))
+        self.var_record_status.set(f"Recording: {path.name} (0)")
+        self._set_sensor_stream_ui(True)
+        self._sensor_log(f"Recording live UDP → {path}")
+
+    def on_record_stop(self) -> None:
+        if self._sensor_recorder is None:
+            return
+        self._stop_sensor_recorder(log=True)
+        self._set_sensor_stream_ui(
+            self._sensor_receiver is not None and self._sensor_receiver.running
+        )
+
+    def on_replay_start(self) -> None:
+        if self._sensor_receiver is not None and self._sensor_receiver.running:
+            messagebox.showwarning(
+                "Replay",
+                "Stop the current stream (UDP or replay) before playing a recording.",
+            )
+            return
+        path_text = (self.var_replay_path.get() or "").strip()
+        if not path_text:
+            messagebox.showwarning("Replay", "Choose a CSV recording to play.")
+            return
+        path = Path(path_text).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            speed = float(self.var_replay_speed.get().strip() or "1.0")
+        except ValueError:
+            messagebox.showwarning("Replay", "Replay speed must be a number.")
+            return
+        if speed <= 0:
+            messagebox.showwarning("Replay", "Replay speed must be > 0.")
+            return
+
+        try:
+            samples = load_recording_csv(path)
+        except RecordingError as exc:
+            messagebox.showerror("Replay", str(exc))
+            return
+
+        def on_error(msg: str) -> None:
+            self._queue_ui("sensor_error", msg)
+
+        def on_finished() -> None:
+            self._queue_ui("sensor_replay_finished")
+
+        try:
+            player = SensorReplay(
+                samples,
+                loop=bool(self.var_replay_loop.get()),
+                speed=speed,
+                on_error=on_error,
+                on_finished=on_finished,
+                label=path.name,
+            )
+            player.start()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Replay", f"{exc}\n\n{traceback.format_exc()}"
+            )
+            return
+
+        self._sensor_receiver = player
+        self.var_replay_path.set(str(path))
+        upsert_env_value(ENV_PATH, "SENSOR_REPLAY_PATH", str(path))
+        upsert_env_value(ENV_PATH, "SENSOR_REPLAY_SPEED", str(speed))
+        dur = player.duration_sec
+        loop_txt = ", loop" if self.var_replay_loop.get() else ""
+        self.var_sensor_stream.set(
+            f"Replay: {path.name}  ({player.sample_count} samples, "
+            f"{dur:.1f}s @ {speed:g}×{loop_txt})"
+        )
+        self._set_sensor_stream_ui(True)
+        self._sensor_log(
+            f"Replay started: {path} ({player.sample_count} samples, "
+            f"{dur:.2f}s timeline, speed={speed:g}×"
+            f"{', loop' if self.var_replay_loop.get() else ''})."
+        )
+        self._sensor_try_connect_lovense(quiet=True)
+
+    def on_replay_stop(self) -> None:
+        if not isinstance(self._sensor_receiver, SensorReplay):
+            return
+        if self._sensor_control_active:
+            self.on_sensor_end_control()
+        try:
+            self._sensor_receiver.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self._sensor_receiver = None
+        self.var_sensor_stream.set("Replay: stopped")
+        self.var_sensor_value.set("Value: —")
+        self.var_sensor_level.set("Level: —")
+        self._set_sensor_stream_ui(False)
+        self._sensor_log("Replay stopped.")
+
+    def _on_replay_finished_ui(self) -> None:
+        """Called on the UI thread when a non-looping replay ends."""
+        if not isinstance(self._sensor_receiver, SensorReplay):
+            return
+        if self._sensor_control_active:
+            self.on_sensor_end_control()
+        # Thread already exited; drop reference.
+        loops = self._sensor_receiver.loops_completed
+        recv = self._sensor_receiver.stats.received
+        self._sensor_receiver = None
+        self.var_sensor_stream.set("Replay: finished")
+        self._set_sensor_stream_ui(False)
+        self._sensor_log(
+            f"Replay finished (played {recv} sample(s), loops={loops})."
+        )
 
     def on_sensor_begin_control(self) -> None:
         if self._sensor_receiver is None or not self._sensor_receiver.running:
             messagebox.showwarning(
                 "Sensor",
-                "Start the UDP stream first (open this tab or press "
-                "Start stream + Lovense).",
+                "Start the UDP stream or play a recording first, then "
+                "Begin control.",
             )
             return
         try:
@@ -1330,10 +1826,15 @@ class ControllerApp(tk.Tk):
         self._sensor_last_level = None
         self._sensor_last_send_mono = 0.0
         self._sensor_commands_sent = 0
-        self.var_sensor_control.set("Control: ACTIVE — mapping stream → toy")
+        source = (
+            "replay" if isinstance(self._sensor_receiver, SensorReplay) else "UDP"
+        )
+        self.var_sensor_control.set(
+            f"Control: ACTIVE — mapping {source} → toy"
+        )
         self._set_sensor_stream_ui(True)
         self._sensor_log(
-            "Begin control: sensor values mapped to Vibrate:0–20 "
+            f"Begin control ({source}): sensor values mapped to Vibrate:0–20 "
             f"(cmd rate ≤ {self.var_sensor_cmd_hz.get()} Hz)."
         )
 
@@ -1341,7 +1842,10 @@ class ControllerApp(tk.Tk):
         was_active = self._sensor_control_active
         self._sensor_control_active = False
         self.var_sensor_control.set("Control: idle")
-        self._set_sensor_stream_ui(self._sensor_receiver is not None)
+        running = (
+            self._sensor_receiver is not None and self._sensor_receiver.running
+        )
+        self._set_sensor_stream_ui(running)
         if was_active:
             # Stop toy when leaving continuous control
             if not self.var_sensor_test.get() and self._client is not None:
@@ -1368,9 +1872,16 @@ class ControllerApp(tk.Tk):
         canvas.coords(self._sensor_bar_rect, 0, 0, int(width * v), height)
 
     def _sensor_tick(self) -> None:
-        """UI + control loop: poll latest UDP sample and optionally emit intensity."""
+        """UI + control loop: poll latest sample and optionally emit intensity."""
         try:
             receiver = self._sensor_receiver
+            # Keep recording counter fresh even between packets.
+            rec = self._sensor_recorder
+            if rec is not None and not rec.closed:
+                self.var_record_status.set(
+                    f"Recording: {rec.path.name} ({rec.count})"
+                )
+
             if receiver is not None and receiver.running:
                 value = receiver.latest_value
                 stats = receiver.stats
@@ -1378,17 +1889,24 @@ class ControllerApp(tk.Tk):
                     self.var_sensor_value.set(f"Value: {value:.4f}")
                     self._sensor_update_bar(value)
                 else:
-                    self.var_sensor_value.set("Value: (waiting for packets…)")
+                    waiting = (
+                        "Value: (replay starting…)"
+                        if isinstance(receiver, SensorReplay)
+                        else "Value: (waiting for packets…)"
+                    )
+                    self.var_sensor_value.set(waiting)
                     self._sensor_update_bar(None)
 
                 rate = stats.rate_hz(time.monotonic())
+                extra = ""
+                if isinstance(receiver, SensorReplay):
+                    extra = f"  loops={receiver.loops_completed}"
                 self.var_sensor_stats.set(
                     f"recv={stats.received}  rate≈{rate:.1f} Hz  "
                     f"gaps={stats.gaps}  reject={stats.rejected}  "
-                    f"cmds={self._sensor_commands_sent}"
+                    f"cmds={self._sensor_commands_sent}{extra}"
                 )
 
-                level: int | None = None
                 if value is not None:
                     try:
                         params = self._sensor_mapping_params()
@@ -1415,6 +1933,13 @@ class ControllerApp(tk.Tk):
                             time_sec=float(params["time_sec"]),
                             cmd_hz=float(params["cmd_hz"]),
                         )
+            elif (
+                receiver is not None
+                and isinstance(receiver, SensorReplay)
+                and not receiver.running
+            ):
+                # Non-loop replay ended between ticks; clean up if needed.
+                self._on_replay_finished_ui()
             elif self._sensor_receiver is None:
                 # keep idle labels stable
                 pass
@@ -1478,6 +2003,10 @@ class ControllerApp(tk.Tk):
         try:
             if self._sensor_control_active:
                 self.on_sensor_end_control()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._stop_sensor_recorder(log=False)
         except Exception:  # noqa: BLE001
             pass
         try:
